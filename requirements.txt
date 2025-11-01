@@ -1,5 +1,9 @@
 fastapi
 uvicorn
 pandas
+requests
 beautifulsoup4
+numpy
+pydantic
+openpyxl
 python-dotenv
