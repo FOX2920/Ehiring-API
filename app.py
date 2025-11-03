@@ -288,8 +288,7 @@ async def root():
         "status": "ok",
         "message": "Base Hiring API - Trích xuất JD và CV",
         "endpoints": {
-            "get_candidates": "/api/opening/{opening_name_or_id}/candidates",
-            "get_jd": "/api/opening/{opening_name_or_id}/jd"
+            "get_candidates": "/api/opening/{opening_name_or_id}/candidates"
         },
         "note": "Có thể sử dụng opening_name hoặc opening_id. Hệ thống sẽ tự động tìm opening gần nhất bằng cosine similarity nếu dùng name."
     }
@@ -325,12 +324,24 @@ async def get_candidates_by_opening(
         
         candidates = get_candidates_for_opening(opening_id, BASE_API_KEY, start_date_obj, end_date_obj)
         
+        # Lấy JD (Job Description)
+        jds = get_job_descriptions(BASE_API_KEY, use_cache=True)
+        jd = next((jd for jd in jds if jd['id'] == opening_id), None)
+        
+        if not jd:
+            # Thử làm mới cache nếu không tìm thấy
+            jds = get_job_descriptions(BASE_API_KEY, use_cache=False)
+            jd = next((jd for jd in jds if jd['id'] == opening_id), None)
+        
+        job_description = jd['job_description'] if jd else None
+        
         return {
             "success": True,
             "query": opening_name_or_id,
             "opening_id": opening_id,
             "opening_name": matched_name,
             "similarity_score": similarity_score,
+            "job_description": job_description,
             "total_candidates": len(candidates),
             "candidates": candidates
         }
@@ -340,48 +351,6 @@ async def get_candidates_by_opening(
         raise HTTPException(status_code=400, detail=f"Định dạng ngày không hợp lệ: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi khi lấy ứng viên: {str(e)}")
-
-@app.get("/api/opening/{opening_name_or_id}/jd", operation_id="layJDTheoOpening")
-async def get_jd_by_opening(
-    opening_name_or_id: str = Path(..., description="Tên hoặc ID của vị trí tuyển dụng")
-):
-    """Lấy JD (Job Description) theo opening_name hoặc opening_id"""
-    try:
-        # Tìm opening_id từ name hoặc id bằng cosine similarity
-        opening_id, matched_name, similarity_score = find_opening_id_by_name(
-            opening_name_or_id, 
-            BASE_API_KEY
-        )
-        
-        if not opening_id:
-            raise HTTPException(
-                status_code=404, 
-                detail=f"Không tìm thấy vị trí phù hợp với '{opening_name_or_id}'. Similarity score cao nhất: {similarity_score:.2f}"
-            )
-        
-        jds = get_job_descriptions(BASE_API_KEY, use_cache=True)
-        jd = next((jd for jd in jds if jd['id'] == opening_id), None)
-        
-        if not jd:
-            # Thử làm mới cache nếu không tìm thấy
-            jds = get_job_descriptions(BASE_API_KEY, use_cache=False)
-            jd = next((jd for jd in jds if jd['id'] == opening_id), None)
-            if not jd:
-                raise HTTPException(status_code=404, detail=f"Không tìm thấy JD cho opening_id: {opening_id}")
-        
-        return {
-            "success": True,
-            "query": opening_name_or_id,
-            "opening_id": opening_id,
-            "opening_name": matched_name,
-            "similarity_score": similarity_score,
-            "job_description": jd['job_description'],
-            "job_description_html": jd['html_content']
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy JD: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
