@@ -4,6 +4,7 @@ pandas
 requests
 beautifulsoup4
 numpy
+pdfplumber
 pydantic
 openpyxl
 python-dotenv
