@@ -298,8 +298,7 @@ async def root():
 async def get_candidates_by_opening(
     opening_name_or_id: str = Path(..., description="Tên hoặc ID của vị trí tuyển dụng"),
     start_date: Optional[str] = Query(None, description="Ngày bắt đầu lọc ứng viên (YYYY-MM-DD). Bỏ trống để lấy tất cả."),
-    end_date: Optional[str] = Query(None, description="Ngày kết thúc lọc ứng viên (YYYY-MM-DD). Bỏ trống để lấy tất cả."),
-    similarity_threshold: float = Query(0.5, description="Ngưỡng cosine similarity để tìm opening gần nhất (0.0-1.0, mặc định: 0.5)")
+    end_date: Optional[str] = Query(None, description="Ngày kết thúc lọc ứng viên (YYYY-MM-DD). Bỏ trống để lấy tất cả.")
 ):
     """Lấy tất cả ứng viên theo opening_name hoặc opening_id (bao gồm cv_text)"""
     try:
@@ -315,8 +314,7 @@ async def get_candidates_by_opening(
         # Tìm opening_id từ name hoặc id bằng cosine similarity
         opening_id, matched_name, similarity_score = find_opening_id_by_name(
             opening_name_or_id, 
-            BASE_API_KEY, 
-            similarity_threshold=similarity_threshold
+            BASE_API_KEY
         )
         
         if not opening_id:
@@ -345,16 +343,14 @@ async def get_candidates_by_opening(
 
 @app.get("/api/opening/{opening_name_or_id}/jd", operation_id="layJDTheoOpening")
 async def get_jd_by_opening(
-    opening_name_or_id: str = Path(..., description="Tên hoặc ID của vị trí tuyển dụng"),
-    similarity_threshold: float = Query(0.5, description="Ngưỡng cosine similarity để tìm opening gần nhất (0.0-1.0, mặc định: 0.5)")
+    opening_name_or_id: str = Path(..., description="Tên hoặc ID của vị trí tuyển dụng")
 ):
     """Lấy JD (Job Description) theo opening_name hoặc opening_id"""
     try:
         # Tìm opening_id từ name hoặc id bằng cosine similarity
         opening_id, matched_name, similarity_score = find_opening_id_by_name(
             opening_name_or_id, 
-            BASE_API_KEY, 
-            similarity_threshold=similarity_threshold
+            BASE_API_KEY
         )
         
         if not opening_id:
