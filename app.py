@@ -11,6 +11,9 @@ import requests
 from bs4 import BeautifulSoup
 import os
 import numpy as np
+from time import time
+import pdfplumber
+from io import BytesIO
 
 app = FastAPI(title="Base Hiring API - JD và CV Extractor")
 
@@ -26,12 +29,26 @@ app.add_middleware(
 # Configuration
 BASE_API_KEY = os.getenv('BASE_API_KEY')
 
+# Cache configuration
+CACHE_TTL = 300  # 5 phút cache
+_cache = {
+    'openings': {'data': None, 'timestamp': 0},
+    'job_descriptions': {'data': None, 'timestamp': 0}
+}
+
 # =================================================================
 # Helper Functions
 # =================================================================
 
-def get_base_openings(api_key):
-    """Truy xuất vị trí tuyển dụng đang hoạt động từ Base API"""
+def get_base_openings(api_key, use_cache=True):
+    """Truy xuất vị trí tuyển dụng đang hoạt động từ Base API (có cache)"""
+    current_time = time()
+    
+    # Kiểm tra cache nếu được bật
+    if use_cache and _cache['openings']['data'] is not None:
+        if current_time - _cache['openings']['timestamp'] < CACHE_TTL:
+            return _cache['openings']['data']
+    
     url = "https://hiring.base.vn/publicapi/v2/opening/list"
     
     payload = {'access_token': api_key}
@@ -50,12 +67,23 @@ def get_base_openings(api_key):
             if opening.get('status') == '10'
         ]
         
+        # Lưu vào cache
+        if use_cache:
+            _cache['openings'] = {'data': filtered_openings, 'timestamp': current_time}
+        
         return filtered_openings
     else:
         raise HTTPException(status_code=response.status_code, detail=f"Lỗi API: {response.text}")
 
-def get_job_descriptions(api_key):
-    """Truy xuất JD (Job Description) từ các vị trí tuyển dụng đang mở"""
+def get_job_descriptions(api_key, use_cache=True):
+    """Truy xuất JD (Job Description) từ các vị trí tuyển dụng đang mở (có cache)"""
+    current_time = time()
+    
+    # Kiểm tra cache nếu được bật
+    if use_cache and _cache['job_descriptions']['data'] is not None:
+        if current_time - _cache['job_descriptions']['timestamp'] < CACHE_TTL:
+            return _cache['job_descriptions']['data']
+    
     url = "https://hiring.base.vn/publicapi/v2/opening/list"
     payload = {'access_token': api_key}
     headers = {'Content-Type': 'application/x-www-form-urlencoded'}
@@ -86,6 +114,10 @@ def get_job_descriptions(api_key):
                         "html_content": html_content
                     })
         
+        # Lưu vào cache
+        if use_cache:
+            _cache['job_descriptions'] = {'data': results, 'timestamp': current_time}
+        
         return results
     return []
 
@@ -97,6 +129,32 @@ def extract_message(evaluations):
         text = " ".join(soup.stripped_strings)
         return text
     return None
+
+def extract_text_from_pdf(url):
+    """Trích xuất text từ PDF URL bằng pdfplumber"""
+    if not url:
+        return None
+    
+    try:
+        # Tải file PDF
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        
+        # Đọc PDF từ bytes
+        pdf_file = BytesIO(response.content)
+        
+        text = ""
+        with pdfplumber.open(pdf_file) as pdf:
+            for page_num, page in enumerate(pdf.pages, 1):
+                page_text = page.extract_text()
+                if page_text:
+                    text += f"\n--- Trang {page_num} ---\n"
+                    text += page_text
+        
+        return text.strip() if text else None
+    except Exception as e:
+        # Trả về None nếu lỗi, không throw exception để không làm gián đoạn quá trình
+        return None
 
 def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=None, include_full_info=False):
     """Truy xuất ứng viên cho một vị trí tuyển dụng cụ thể trong khoảng thời gian"""
@@ -125,6 +183,11 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
                 cv_urls = candidate.get('cvs', [])
                 cv_url = cv_urls[0] if isinstance(cv_urls, list) and len(cv_urls) > 0 else None
                 
+                # Trích xuất text từ PDF CV
+                cv_text = None
+                if cv_url:
+                    cv_text = extract_text_from_pdf(cv_url)
+                
                 # Trích xuất đánh giá
                 review = extract_message(candidate.get('evaluations', []))
                 
@@ -142,6 +205,7 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
                     "phone": candidate.get('phone'),
                     "gender": candidate.get('gender'),
                     "cv_url": cv_url,
+                    "cv_text": cv_text,
                     "review": review,
                     "form_data": form_data,
                     "opening_id": opening_id
@@ -165,6 +229,34 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
     else:
         raise HTTPException(status_code=response.status_code, detail=f"Lỗi API: {response.text}")
 
+def find_candidate_by_id(candidate_id, api_key, opening_id=None):
+    """Tìm ứng viên theo ID - tối ưu bằng cách chỉ tìm trong opening_id nếu được cung cấp"""
+    if opening_id:
+        # Nếu biết opening_id, chỉ tìm trong đó (nhanh nhất)
+        candidates = get_candidates_for_opening(opening_id, api_key, None, None, include_full_info=True)
+        candidate = next((c for c in candidates if c['id'] == candidate_id), None)
+        if candidate:
+            openings = get_base_openings(api_key, use_cache=True)
+            opening = next((op for op in openings if op['id'] == opening_id), None)
+            return candidate, opening
+        return None, None
+    else:
+        # Nếu không biết opening_id, phải duyệt qua tất cả (chậm hơn)
+        # Sử dụng cache để giảm số lần gọi API
+        openings = get_base_openings(api_key, use_cache=True)
+        for opening in openings:
+            candidates = get_candidates_for_opening(
+                opening['id'], 
+                api_key, 
+                None, 
+                None,
+                include_full_info=True
+            )
+            candidate = next((c for c in candidates if c['id'] == candidate_id), None)
+            if candidate:
+                return candidate, opening
+        return None, None
+
 # =================================================================
 # Request/Response Models
 # =================================================================
@@ -181,6 +273,7 @@ class CandidateResponse(BaseModel):
     phone: Optional[str]
     gender: Optional[str]
     cv_url: Optional[str]
+    cv_text: Optional[str]
     review: Optional[str]
     form_data: dict
     opening_id: str
@@ -203,82 +296,27 @@ async def root():
         "status": "ok",
         "message": "Base Hiring API - Trích xuất JD và CV",
         "endpoints": {
-            "job_descriptions": "/api/job-descriptions",
-            "job_description_by_id": "/api/job-descriptions/{opening_id}",
-            "candidates": "/api/candidates/{opening_id}",
-            "candidates_all": "/api/candidates",
+            "opening_full": "/api/opening/{opening_id}",
             "openings": "/api/openings",
-            "ai_job_requirements": "/api/ai/job-requirements/{opening_id}",
             "ai_candidate_form": "/api/ai/candidate-form-data/{candidate_id}",
-            "ai_hiring_process": "/api/ai/hiring-process/{opening_id}",
             "ai_cv_evaluation": "/api/ai/cv-evaluation-data/{candidate_id}",
             "ai_all_data": "/api/ai/all-analysis-data"
         }
     }
 
-@app.get("/api/openings")
-async def get_openings():
-    """
-    Lấy danh sách tất cả vị trí tuyển dụng đang hoạt động
-    """
-    try:
-        openings = get_base_openings(BASE_API_KEY)
-        return {
-            "success": True,
-            "total_records": len(openings),
-            "openings": openings
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy danh sách vị trí: {str(e)}")
-
-@app.get("/api/job-descriptions")
-async def get_all_job_descriptions():
-    """
-    Lấy tất cả JD (Job Description) từ các vị trí tuyển dụng đang mở
-    """
-    try:
-        jds = get_job_descriptions(BASE_API_KEY)
-        return {
-            "success": True,
-            "total_records": len(jds),
-            "job_descriptions": jds
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy JD: {str(e)}")
-
-@app.get("/api/job-descriptions/{opening_id}")
-async def get_job_description_by_id(opening_id: str):
-    """
-    Lấy JD của một vị trí tuyển dụng cụ thể theo ID
-    """
-    try:
-        jds = get_job_descriptions(BASE_API_KEY)
-        jd = next((jd for jd in jds if jd['id'] == opening_id), None)
-        
-        if jd:
-            return {
-                "success": True,
-                "job_description": jd
-            }
-        else:
-            raise HTTPException(status_code=404, detail=f"Không tìm thấy JD cho opening_id: {opening_id}")
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy JD: {str(e)}")
-
-@app.get("/api/candidates/{opening_id}")
-async def get_candidates_by_opening(
+@app.get("/api/opening/{opening_id}")
+async def get_opening_with_candidates(
     opening_id: str,
     start_date: Optional[str] = Query(None, description="Ngày bắt đầu (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="Ngày kết thúc (YYYY-MM-DD)")
 ):
     """
-    Lấy danh sách ứng viên và CV của một vị trí tuyển dụng cụ thể
+    Lấy JD và danh sách ứng viên của một vị trí tuyển dụng trong một response
+    
+    Trả về:
+    - Thông tin vị trí (opening_id, opening_name)
+    - JD đầy đủ (job_description, job_description_html)
+    - Danh sách ứng viên và CV
     
     Parameters:
     - opening_id: ID của vị trí tuyển dụng
@@ -299,19 +337,28 @@ async def get_candidates_by_opening(
         if start_date_obj and end_date_obj and start_date_obj > end_date_obj:
             raise HTTPException(status_code=400, detail="Ngày kết thúc phải sau ngày bắt đầu")
         
-        # Get opening name
-        openings = get_base_openings(BASE_API_KEY)
+        # Lấy JD từ cache
+        jds = get_job_descriptions(BASE_API_KEY, use_cache=True)
+        jd = next((jd for jd in jds if jd['id'] == opening_id), None)
+        
+        if not jd:
+            raise HTTPException(status_code=404, detail=f"Không tìm thấy JD cho opening_id: {opening_id}")
+        
+        # Lấy opening name từ cache
+        openings = get_base_openings(BASE_API_KEY, use_cache=True)
         opening = next((op for op in openings if op['id'] == opening_id), None)
         opening_name = opening['name'] if opening else None
         
-        # Get candidates
+        # Lấy candidates
         candidates = get_candidates_for_opening(opening_id, BASE_API_KEY, start_date_obj, end_date_obj, include_full_info=False)
         
         return {
             "success": True,
-            "total_records": len(candidates),
             "opening_id": opening_id,
             "opening_name": opening_name,
+            "job_description": jd['job_description'],
+            "job_description_html": jd['html_content'],
+            "total_candidates": len(candidates),
             "candidates": candidates
         }
     except HTTPException:
@@ -319,7 +366,27 @@ async def get_candidates_by_opening(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Định dạng ngày không hợp lệ: {str(e)}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy ứng viên: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy dữ liệu: {str(e)}")
+
+@app.get("/api/openings")
+async def get_openings(use_cache: bool = Query(True, description="Sử dụng cache (mặc định: true)")):
+    """
+    Lấy danh sách tất cả vị trí tuyển dụng đang hoạt động
+    
+    Parameters:
+    - use_cache: Sử dụng cache để tăng tốc độ (mặc định: true)
+    """
+    try:
+        openings = get_base_openings(BASE_API_KEY, use_cache=use_cache)
+        return {
+            "success": True,
+            "total_records": len(openings),
+            "openings": openings
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy danh sách vị trí: {str(e)}")
 
 @app.get("/api/candidates")
 async def get_all_candidates(
@@ -352,8 +419,8 @@ async def get_all_candidates(
         all_candidates = []
         
         if opening_id:
-            # Lấy ứng viên từ một vị trí cụ thể
-            openings = get_base_openings(BASE_API_KEY)
+            # Lấy ứng viên từ một vị trí cụ thể (sử dụng cache)
+            openings = get_base_openings(BASE_API_KEY, use_cache=True)
             opening = next((op for op in openings if op['id'] == opening_id), None)
             
             if not opening:
@@ -362,8 +429,8 @@ async def get_all_candidates(
             candidates = get_candidates_for_opening(opening_id, BASE_API_KEY, start_date_obj, end_date_obj, include_full_info=False)
             all_candidates.extend(candidates)
         else:
-            # Lấy ứng viên từ tất cả vị trí
-            openings = get_base_openings(BASE_API_KEY)
+            # Lấy ứng viên từ tất cả vị trí (sử dụng cache)
+            openings = get_base_openings(BASE_API_KEY, use_cache=True)
             
             for opening in openings:
                 candidates = get_candidates_for_opening(
@@ -391,41 +458,11 @@ async def get_all_candidates(
 # AI Analysis Endpoints - Trích xuất dữ liệu cho AI phân tích
 # =================================================================
 
-@app.get("/api/ai/job-requirements/{opening_id}")
-async def get_job_requirements_for_ai(opening_id: str):
-    """
-    Lấy yêu cầu chi tiết của công ty cho vị trí để AI chấm điểm CV
-    
-    Trả về:
-    - JD đầy đủ với yêu cầu công việc
-    - Thông tin vị trí
-    - Yêu cầu kỹ năng, kinh nghiệm
-    """
-    try:
-        jds = get_job_descriptions(BASE_API_KEY)
-        jd = next((jd for jd in jds if jd['id'] == opening_id), None)
-        
-        if not jd:
-            raise HTTPException(status_code=404, detail=f"Không tìm thấy JD cho opening_id: {opening_id}")
-        
-        # Lấy thông tin mở rộng về vị trí
-        openings = get_base_openings(BASE_API_KEY)
-        opening = next((op for op in openings if op['id'] == opening_id), None)
-        
-        return {
-            "success": True,
-            "opening_id": opening_id,
-            "opening_name": opening['name'] if opening else None,
-            "job_description": jd['job_description'],
-            "job_description_html": jd['html_content']
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy yêu cầu công việc: {str(e)}")
-
 @app.get("/api/ai/candidate-form-data/{candidate_id}")
-async def get_candidate_form_data_for_ai(candidate_id: str):
+async def get_candidate_form_data_for_ai(
+    candidate_id: str,
+    opening_id: Optional[str] = Query(None, description="ID vị trí tuyển dụng (tùy chọn, giúp tìm nhanh hơn)")
+):
     """
     Lấy dữ liệu form ứng viên chi tiết để AI đánh giá năng lực và phù hợp
     
@@ -433,33 +470,22 @@ async def get_candidate_form_data_for_ai(candidate_id: str):
     - Tất cả thông tin form ứng viên đã điền
     - Đánh giá hiện có (nếu có)
     - Thông tin ứng viên cơ bản
+    
+    Parameters:
+    - candidate_id: ID của ứng viên
+    - opening_id: ID vị trí tuyển dụng (tùy chọn, nếu có sẽ tìm nhanh hơn)
     """
     try:
-        # Lấy tất cả ứng viên từ tất cả vị trí để tìm candidate_id
-        openings = get_base_openings(BASE_API_KEY)
-        candidate_found = None
-        opening_info = None
-        
-        for opening in openings:
-            candidates = get_candidates_for_opening(
-                opening['id'], 
-                BASE_API_KEY, 
-                None, 
-                None,
-                include_full_info=True
-            )
-            
-            candidate = next((c for c in candidates if c['id'] == candidate_id), None)
-            if candidate:
-                candidate_found = candidate
-                opening_info = {
-                    "opening_id": opening['id'],
-                    "opening_name": opening['name']
-                }
-                break
+        # Tìm ứng viên bằng helper function tối ưu
+        candidate_found, opening = find_candidate_by_id(candidate_id, BASE_API_KEY, opening_id)
         
         if not candidate_found:
             raise HTTPException(status_code=404, detail=f"Không tìm thấy ứng viên với ID: {candidate_id}")
+        
+        opening_info = {
+            "opening_id": opening['id'],
+            "opening_name": opening['name']
+        } if opening else None
         
         # Mapping form fields để dễ đọc
         form_field_mapping = {
@@ -501,6 +527,7 @@ async def get_candidate_form_data_for_ai(candidate_id: str):
             "form_data_raw": candidate_found.get('form_data', {}),
             "review": candidate_found.get('review'),
             "cv_url": candidate_found.get('cv_url'),
+            "cv_text": candidate_found.get('cv_text'),
             "status": candidate_found.get('status'),
             "stage": candidate_found.get('stage')
         }
@@ -534,8 +561,8 @@ async def get_hiring_process_for_ai(
         if end_date:
             end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
         
-        # Get opening info
-        openings = get_base_openings(BASE_API_KEY)
+        # Get opening info (sử dụng cache)
+        openings = get_base_openings(BASE_API_KEY, use_cache=True)
         opening = next((op for op in openings if op['id'] == opening_id), None)
         
         if not opening:
@@ -607,7 +634,10 @@ async def get_hiring_process_for_ai(
         raise HTTPException(status_code=500, detail=f"Lỗi khi lấy thông tin quy trình: {str(e)}")
 
 @app.get("/api/ai/cv-evaluation-data/{candidate_id}")
-async def get_cv_evaluation_data_for_ai(candidate_id: str):
+async def get_cv_evaluation_data_for_ai(
+    candidate_id: str,
+    opening_id: Optional[str] = Query(None, description="ID vị trí tuyển dụng (tùy chọn, giúp tìm nhanh hơn)")
+):
     """
     Lấy dữ liệu đầy đủ để AI chấm điểm CV (JD + CV + Form data)
     
@@ -616,37 +646,29 @@ async def get_cv_evaluation_data_for_ai(candidate_id: str):
     - CV URL của ứng viên
     - Form data của ứng viên
     - Thông tin cơ bản
+    
+    Parameters:
+    - candidate_id: ID của ứng viên
+    - opening_id: ID vị trí tuyển dụng (tùy chọn, nếu có sẽ tìm nhanh hơn)
     """
     try:
-        # Lấy thông tin ứng viên
-        openings = get_base_openings(BASE_API_KEY)
-        candidate_found = None
-        opening_info = None
-        
-        for opening in openings:
-            candidates = get_candidates_for_opening(
-                opening['id'], 
-                BASE_API_KEY, 
-                None, 
-                None,
-                include_full_info=True
-            )
-            
-            candidate = next((c for c in candidates if c['id'] == candidate_id), None)
-            if candidate:
-                candidate_found = candidate
-                opening_info = {
-                    "opening_id": opening['id'],
-                    "opening_name": opening['name']
-                }
-                break
+        # Tìm ứng viên bằng helper function tối ưu
+        candidate_found, opening = find_candidate_by_id(candidate_id, BASE_API_KEY, opening_id)
         
         if not candidate_found:
             raise HTTPException(status_code=404, detail=f"Không tìm thấy ứng viên với ID: {candidate_id}")
         
-        # Lấy JD
-        jds = get_job_descriptions(BASE_API_KEY)
-        jd = next((jd for jd in jds if jd['id'] == opening_info['opening_id']), None)
+        opening_info = {
+            "opening_id": opening['id'],
+            "opening_name": opening['name']
+        } if opening else None
+        
+        # Lấy JD từ cache
+        if opening_info:
+            jds = get_job_descriptions(BASE_API_KEY, use_cache=True)
+            jd = next((jd for jd in jds if jd['id'] == opening_info['opening_id']), None)
+        else:
+            jd = None
         
         return {
             "success": True,
@@ -656,6 +678,7 @@ async def get_cv_evaluation_data_for_ai(candidate_id: str):
             "job_description": jd['job_description'] if jd else None,
             "job_description_html": jd['html_content'] if jd else None,
             "cv_url": candidate_found.get('cv_url'),
+            "cv_text": candidate_found.get('cv_text'),
             "form_data": candidate_found.get('form_data', {}),
             "review": candidate_found.get('review')
         }
@@ -688,11 +711,9 @@ async def get_all_analysis_data_for_ai(
         if end_date:
             end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
         
-        # Lấy JD
-        jds = get_job_descriptions(BASE_API_KEY)
-        
-        # Lấy openings
-        openings = get_base_openings(BASE_API_KEY)
+        # Lấy JD và openings (sử dụng cache)
+        jds = get_job_descriptions(BASE_API_KEY, use_cache=True)
+        openings = get_base_openings(BASE_API_KEY, use_cache=True)
         
         # Lọc theo opening_id nếu có
         if opening_id:
