@@ -288,10 +288,57 @@ async def root():
         "status": "ok",
         "message": "Base Hiring API - Trích xuất JD và CV",
         "endpoints": {
-            "get_candidates": "/api/opening/{opening_name_or_id}/candidates"
+            "get_candidates": "/api/opening/{opening_name_or_id}/candidates",
+            "get_job_description": "/api/opening/{opening_name_or_id}/job-description"
         },
         "note": "Có thể sử dụng opening_name hoặc opening_id. Hệ thống sẽ tự động tìm opening gần nhất bằng cosine similarity nếu dùng name."
     }
+
+@app.get("/api/opening/{opening_name_or_id}/job-description", operation_id="layJobDescriptionTheoOpening")
+async def get_job_description_by_opening(
+    opening_name_or_id: str = Path(..., description="Tên hoặc ID của vị trí tuyển dụng")
+):
+    """Lấy JD (Job Description) theo opening_name hoặc opening_id"""
+    try:
+        # Tìm opening_id từ name hoặc id bằng cosine similarity
+        opening_id, matched_name, similarity_score = find_opening_id_by_name(
+            opening_name_or_id, 
+            BASE_API_KEY
+        )
+        
+        if not opening_id:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"Không tìm thấy vị trí phù hợp với '{opening_name_or_id}'. Similarity score cao nhất: {similarity_score:.2f}"
+            )
+        
+        # Lấy JD (Job Description)
+        jds = get_job_descriptions(BASE_API_KEY, use_cache=True)
+        jd = next((jd for jd in jds if jd['id'] == opening_id), None)
+        
+        if not jd:
+            # Thử làm mới cache nếu không tìm thấy
+            jds = get_job_descriptions(BASE_API_KEY, use_cache=False)
+            jd = next((jd for jd in jds if jd['id'] == opening_id), None)
+        
+        if not jd:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Không tìm thấy JD cho vị trí '{opening_name_or_id}'"
+            )
+        
+        return {
+            "success": True,
+            "query": opening_name_or_id,
+            "opening_id": opening_id,
+            "opening_name": matched_name,
+            "similarity_score": similarity_score,
+            "job_description": jd['job_description']
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy JD: {str(e)}")
 
 @app.get("/api/opening/{opening_name_or_id}/candidates", operation_id="layUngVienTheoOpening")
 async def get_candidates_by_opening(
