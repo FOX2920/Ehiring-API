@@ -32,7 +32,7 @@ app.add_middleware(
 )
 
 # Configuration
-BASE_API_KEY = os.getenv('BASE_API_KEY', 'YOUR_FALLBACK_API_KEY_IF_NEEDED')
+BASE_API_KEY = os.getenv('BASE_API_KEY')
 
 # Cache configuration
 CACHE_TTL = 300  # 5 phút cache
@@ -246,10 +246,13 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
                 "email": candidate.get('email'),
                 "phone": candidate.get('phone'),
                 "gender": candidate.get('gender'),
+                "cv_url": cv_url,
                 "cv_text": cv_text,  # Thay cv_url bằng cv_text
                 "review": review,
                 "form_data": form_data,
-                "opening_id": opening_id
+                "opening_id": opening_id,
+                "stage_id": candidate.get('stage_id'),
+                "stage_name": candidate.get('stage_name')
             }
             
             candidates.append(candidate_info)
@@ -272,10 +275,13 @@ class CandidateResponse(BaseModel):
     email: Optional[str]
     phone: Optional[str]
     gender: Optional[str]
+    cv_url: Optional[str]
     cv_text: Optional[str]
     review: Optional[str]
     form_data: dict
     opening_id: str
+    stage_id: Optional[str]
+    stage_name: Optional[str]
 
 # =================================================================
 # API Endpoints
