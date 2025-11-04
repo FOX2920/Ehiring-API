@@ -15,7 +15,8 @@ from io import BytesIO
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
-
+from google import genai
+from google.genai import types
 app = FastAPI(
     title="Base Hiring API - JD và CV Extractor",
     description="API để trích xuất dữ liệu JD (Job Description) và CV từ Base Hiring API",
@@ -31,8 +32,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration
+# Configuration - Load from .env file
 BASE_API_KEY = os.getenv('BASE_API_KEY')
+if not BASE_API_KEY:
+    raise ValueError("BASE_API_KEY chưa được cấu hình trong file .env")
+
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY chưa được cấu hình trong file .env")
+
+# Parse GEMINI_API_KEY_DU_PHONG từ string (comma-separated) sang list
+GEMINI_API_KEY_DU_PHONG_STR = os.getenv('GEMINI_API_KEY_DU_PHONG', '')
+GEMINI_API_KEY_DU_PHONG = [key.strip() for key in GEMINI_API_KEY_DU_PHONG_STR.split(',') if key.strip()] if GEMINI_API_KEY_DU_PHONG_STR else []
 
 # Cache configuration
 CACHE_TTL = 300  # 5 phút cache
@@ -139,7 +150,7 @@ def extract_message(evaluations):
     return None
 
 def extract_text_from_pdf(url):
-    """Trích xuất text từ PDF URL bằng pdfplumber"""
+    """Trích xuất text từ PDF URL bằng pdfplumber (fallback method)"""
     if not url:
         return None
     try:
@@ -156,6 +167,77 @@ def extract_text_from_pdf(url):
         return text.strip() if text else None
     except Exception as e:
         return None
+
+def extract_text_from_cv_url_with_genai(url):
+    """Trích xuất text từ CV URL bằng Google Gemini AI"""
+    if not url:
+        return None
+    
+    # Thử với API key chính trước
+    api_keys_to_try = [GEMINI_API_KEY] + GEMINI_API_KEY_DU_PHONG
+    
+    for idx, api_key in enumerate(api_keys_to_try):
+        try:
+            client = genai.Client(api_key=api_key)
+            
+            model = "gemini-flash-lite-latest"
+            contents = [
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_text(text=f"{url}\nĐọc text từ url"),
+                    ],
+                ),
+            ]
+            tools = [
+                types.Tool(url_context=types.UrlContext()),
+            ]
+            generate_content_config = types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(
+                    thinking_budget=0,
+                ),
+                tools=tools,
+                system_instruction=[
+                    types.Part.from_text(text="Nội dung text trong link"),
+                ],
+            )
+            
+            # Thu thập tất cả text từ stream
+            text_content = ""
+            for chunk in client.models.generate_content_stream(
+                model=model,
+                contents=contents,
+                config=generate_content_config,
+            ):
+                if chunk.text:
+                    text_content += chunk.text
+            
+            if text_content.strip():
+                return text_content.strip()
+                
+        except Exception as e:
+            error_str = str(e).lower()
+            error_repr = repr(e).lower()
+            
+            # Kiểm tra nếu là lỗi 429 (rate limit)
+            is_rate_limit = (
+                '429' in error_str or 
+                '429' in error_repr or
+                'rate limit' in error_str or
+                'rate_limit' in error_str or
+                'quota exceeded' in error_str or
+                'resource exhausted' in error_str
+            )
+            
+            # Nếu là lỗi 429 và còn API key khác, thử key tiếp theo
+            if is_rate_limit and idx < len(api_keys_to_try) - 1:
+                continue
+            
+            # Nếu không phải lỗi 429 hoặc đã hết key, tiếp tục thử key tiếp theo hoặc fallback
+            continue
+    
+    # Nếu tất cả API keys đều fail, fallback về pdfplumber
+    return extract_text_from_pdf(url)
 
 def find_opening_id_by_name(query_name, api_key, similarity_threshold=0.5):
     """Tìm opening_id gần nhất với query_name bằng cosine similarity"""
@@ -227,10 +309,10 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
             cv_urls = candidate.get('cvs', [])
             cv_url = cv_urls[0] if isinstance(cv_urls, list) and len(cv_urls) > 0 else None
             
-            # Luôn trích xuất cv_text từ PDF
+            # Luôn trích xuất cv_text từ CV URL bằng genai (fallback về pdfplumber nếu fail)
             cv_text = None
             if cv_url:
-                cv_text = extract_text_from_pdf(cv_url)
+                cv_text = extract_text_from_cv_url_with_genai(cv_url)
             
             review = extract_message(candidate.get('evaluations', []))
             
