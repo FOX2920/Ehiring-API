@@ -342,7 +342,8 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
                         # Nếu có lỗi trong vectorization, lấy tất cả
                         matching_stage_names = None
         
-        candidates = []
+        # Bước 1: Lọc ứng viên theo stage_name trước (chưa trích xuất cv_text để tiết kiệm request)
+        filtered_candidates = []
         for candidate in data['candidates']:
             # Lọc theo stage_name nếu có matching_stage_names
             if matching_stage_names is not None:
@@ -350,10 +351,15 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
                 if candidate_stage_name not in matching_stage_names:
                     continue
             
+            filtered_candidates.append(candidate)
+        
+        # Bước 2: Trích xuất cv_text chỉ cho các ứng viên đã được lọc
+        candidates = []
+        for candidate in filtered_candidates:
             cv_urls = candidate.get('cvs', [])
             cv_url = cv_urls[0] if isinstance(cv_urls, list) and len(cv_urls) > 0 else None
             
-            # Luôn trích xuất cv_text từ CV URL bằng genai (fallback về pdfplumber nếu fail)
+            # Chỉ trích xuất cv_text từ CV URL sau khi đã lọc xong (tiết kiệm request Gemini)
             cv_text = None
             if cv_url:
                 cv_text = extract_text_from_cv_url_with_genai(cv_url)
@@ -373,7 +379,7 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
                 "phone": candidate.get('phone'),
                 "gender": candidate.get('gender'),
                 "cv_url": cv_url,
-                "cv_text": cv_text,  # Thay cv_url bằng cv_text
+                "cv_text": cv_text,
                 "review": review,
                 "form_data": form_data,
                 "opening_id": opening_id,
