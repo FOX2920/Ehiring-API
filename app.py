@@ -280,7 +280,7 @@ def find_opening_id_by_name(query_name, api_key, similarity_threshold=0.5):
         # Nếu có lỗi trong vectorization, trả về None
         return None, None, 0.0
 
-def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=None):
+def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=None, stage_name=None):
     """Truy xuất ứng viên cho một vị trí tuyển dụng cụ thể trong khoảng thời gian (luôn có cv_text)"""
     url = "https://hiring.base.vn/publicapi/v2/candidate/list"
     
@@ -304,8 +304,52 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
 
     data = response.json()
     if 'candidates' in data and data['candidates']:
+        # Nếu có stage_name, tìm các stage name phù hợp bằng cosine similarity
+        matching_stage_names = None
+        if stage_name is not None:
+            # Thu thập tất cả stage_name unique từ candidates
+            all_stage_names = list(set([
+                candidate.get('stage_name', '') 
+                for candidate in data['candidates'] 
+                if candidate.get('stage_name')
+            ]))
+            
+            if not all_stage_names:
+                # Nếu không có stage_name nào, lấy tất cả
+                matching_stage_names = None
+            else:
+                # Kiểm tra exact match trước
+                if stage_name in all_stage_names:
+                    matching_stage_names = [stage_name]
+                else:
+                    # Dùng cosine similarity để tìm stage name gần nhất
+                    try:
+                        vectorizer = TfidfVectorizer()
+                        stage_vectors = vectorizer.fit_transform(all_stage_names)
+                        query_vector = vectorizer.transform([stage_name])
+                        
+                        similarities = cosine_similarity(query_vector, stage_vectors).flatten()
+                        best_idx = np.argmax(similarities)
+                        best_similarity = similarities[best_idx]
+                        
+                        # Nếu similarity >= 0.3, lấy stage name đó (ngưỡng thấp để bao quát hơn)
+                        if best_similarity >= 0.3:
+                            matching_stage_names = [all_stage_names[best_idx]]
+                        else:
+                            # Nếu không tìm thấy gì phù hợp, lấy tất cả
+                            matching_stage_names = None
+                    except Exception:
+                        # Nếu có lỗi trong vectorization, lấy tất cả
+                        matching_stage_names = None
+        
         candidates = []
         for candidate in data['candidates']:
+            # Lọc theo stage_name nếu có matching_stage_names
+            if matching_stage_names is not None:
+                candidate_stage_name = candidate.get('stage_name', '')
+                if candidate_stage_name not in matching_stage_names:
+                    continue
+            
             cv_urls = candidate.get('cvs', [])
             cv_url = cv_urls[0] if isinstance(cv_urls, list) and len(cv_urls) > 0 else None
             
@@ -432,7 +476,8 @@ async def get_job_description_by_opening(
 async def get_candidates_by_opening(
     opening_name_or_id: str = Path(..., description="Tên hoặc ID của vị trí tuyển dụng"),
     start_date: Optional[str] = Query(None, description="Ngày bắt đầu lọc ứng viên (YYYY-MM-DD). Bỏ trống để lấy tất cả."),
-    end_date: Optional[str] = Query(None, description="Ngày kết thúc lọc ứng viên (YYYY-MM-DD). Bỏ trống để lấy tất cả.")
+    end_date: Optional[str] = Query(None, description="Ngày kết thúc lọc ứng viên (YYYY-MM-DD). Bỏ trống để lấy tất cả."),
+    stage_name: Optional[str] = Query(None, description="Lọc ứng viên theo stage name. Bỏ trống để lấy tất cả.")
 ):
     """Lấy tất cả ứng viên theo opening_name hoặc opening_id (bao gồm cv_text)"""
     try:
@@ -457,7 +502,7 @@ async def get_candidates_by_opening(
                 detail=f"Không tìm thấy vị trí phù hợp với '{opening_name_or_id}'. Similarity score cao nhất: {similarity_score:.2f}"
             )
         
-        candidates = get_candidates_for_opening(opening_id, BASE_API_KEY, start_date_obj, end_date_obj)
+        candidates = get_candidates_for_opening(opening_id, BASE_API_KEY, start_date_obj, end_date_obj, stage_name)
         
         # Lấy JD (Job Description)
         jds = get_job_descriptions(BASE_API_KEY, use_cache=True)
