@@ -392,6 +392,60 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
         return candidates
     return []
 
+def get_interviews(api_key, start_date=None, end_date=None, opening_id=None):
+    """Truy xuất lịch phỏng vấn từ Base API"""
+    url = "https://hiring.base.vn/publicapi/v2/interview/list"
+    
+    payload = {
+        'access_token': api_key,
+    }
+    
+    if start_date:
+        payload['start_date'] = start_date.strftime('%Y-%m-%d') if isinstance(start_date, date) else start_date
+    if end_date:
+        payload['end_date'] = end_date.strftime('%Y-%m-%d') if isinstance(end_date, date) else end_date
+    
+    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+    
+    try:
+        response = requests.post(url, headers=headers, data=payload, timeout=15)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=503, detail=f"Lỗi kết nối đến Base API khi lấy lịch phỏng vấn: {e}")
+
+    data = response.json()
+    if 'interviews' in data and data['interviews']:
+        interviews = data['interviews']
+        
+        # Nếu có opening_id, lọc theo opening_id
+        if opening_id:
+            interviews = [
+                interview for interview in interviews
+                if interview.get('opening_id') == opening_id
+            ]
+        
+        # Xử lý timestamp thành datetime
+        processed_interviews = []
+        for interview in interviews:
+            processed_interview = dict(interview)
+            
+            # Chuyển đổi timestamp sang datetime nếu có
+            timestamp_fields = ['time', 'date', 'since']
+            for field in timestamp_fields:
+                if field in processed_interview and processed_interview[field]:
+                    try:
+                        timestamp = int(processed_interview[field])
+                        dt = datetime.fromtimestamp(timestamp)
+                        processed_interview[f'{field}_dt'] = dt.isoformat()
+                    except (ValueError, TypeError, OSError):
+                        pass
+            
+            processed_interviews.append(processed_interview)
+        
+        return processed_interviews
+    
+    return []
+
 # =================================================================
 # Request/Response Models
 # =================================================================
@@ -427,7 +481,8 @@ async def root():
         "message": "Base Hiring API - Trích xuất JD và CV",
         "endpoints": {
             "get_candidates": "/api/opening/{opening_name_or_id}/candidates",
-            "get_job_description": "/api/opening/{opening_name_or_id}/job-description"
+            "get_job_description": "/api/opening/{opening_name_or_id}/job-description",
+            "get_interviews": "/api/interviews"
         },
         "note": "Có thể sử dụng opening_name hoặc opening_id. Hệ thống sẽ tự động tìm opening gần nhất bằng cosine similarity nếu dùng name."
     }
@@ -537,6 +592,56 @@ async def get_candidates_by_opening(
         raise HTTPException(status_code=400, detail=f"Định dạng ngày không hợp lệ: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi khi lấy ứng viên: {str(e)}")
+
+@app.get("/api/interviews", operation_id="layLichPhongVan")
+async def get_interviews_by_opening(
+    opening_name_or_id: Optional[str] = Query(None, description="Tên hoặc ID của vị trí tuyển dụng để lọc. Bỏ trống để lấy tất cả."),
+    start_date: Optional[str] = Query(None, description="Ngày bắt đầu lọc lịch phỏng vấn (YYYY-MM-DD). Bỏ trống để lấy tất cả."),
+    end_date: Optional[str] = Query(None, description="Ngày kết thúc lọc lịch phỏng vấn (YYYY-MM-DD). Bỏ trống để lấy tất cả.")
+):
+    """Lấy lịch phỏng vấn, có thể lọc theo opening_name hoặc opening_id (tự động tìm bằng cosine similarity)"""
+    try:
+        start_date_obj, end_date_obj = None, None
+        if start_date:
+            start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
+        if end_date:
+            end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
+        
+        if start_date_obj and end_date_obj and start_date_obj > end_date_obj:
+            raise HTTPException(status_code=400, detail="Ngày kết thúc phải sau ngày bắt đầu")
+        
+        opening_id = None
+        matched_name = None
+        similarity_score = None
+        
+        # Nếu có opening_name_or_id, tìm opening_id bằng cosine similarity
+        if opening_name_or_id:
+            opening_id, matched_name, similarity_score = find_opening_id_by_name(
+                opening_name_or_id,
+                BASE_API_KEY
+            )
+            
+            if not opening_id:
+                # Nếu không tìm thấy, vẫn trả về tất cả interviews nhưng có thông báo
+                opening_id = None
+        
+        interviews = get_interviews(BASE_API_KEY, start_date_obj, end_date_obj, opening_id)
+        
+        return {
+            "success": True,
+            "query": opening_name_or_id,
+            "opening_id": opening_id,
+            "opening_name": matched_name,
+            "similarity_score": similarity_score,
+            "total_interviews": len(interviews),
+            "interviews": interviews
+        }
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Định dạng ngày không hợp lệ: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy lịch phỏng vấn: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
