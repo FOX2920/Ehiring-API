@@ -17,6 +17,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 from google import genai
 from google.genai import types
+from pytz import timezone
 app = FastAPI(
     title="Base Hiring API - JD và CV Extractor",
     description="API để trích xuất dữ liệu JD (Job Description) và CV từ Base Hiring API",
@@ -393,7 +394,7 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
     return []
 
 def get_interviews(api_key, start_date=None, end_date=None, opening_id=None):
-    """Truy xuất lịch phỏng vấn từ Base API"""
+    """Truy xuất lịch phỏng vấn từ Base API, chỉ trả về các trường quan trọng"""
     url = "https://hiring.base.vn/publicapi/v2/interview/list"
     
     payload = {
@@ -424,21 +425,29 @@ def get_interviews(api_key, start_date=None, end_date=None, opening_id=None):
                 if interview.get('opening_id') == opening_id
             ]
         
-        # Xử lý timestamp thành datetime
+        # Xử lý và chỉ lấy các trường quan trọng
         processed_interviews = []
+        hcm_tz = timezone('Asia/Ho_Chi_Minh')
+        
         for interview in interviews:
-            processed_interview = dict(interview)
+            # Chỉ lấy các trường quan trọng
+            processed_interview = {
+                'id': interview.get('id'),
+                'candidate_id': interview.get('candidate_id'),
+                'candidate_name': interview.get('candidate_name'),
+                'opening_name': interview.get('opening_name'),
+                'time_dt': None
+            }
             
-            # Chuyển đổi timestamp sang datetime nếu có
-            timestamp_fields = ['time', 'date', 'since']
-            for field in timestamp_fields:
-                if field in processed_interview and processed_interview[field]:
-                    try:
-                        timestamp = int(processed_interview[field])
-                        dt = datetime.fromtimestamp(timestamp)
-                        processed_interview[f'{field}_dt'] = dt.isoformat()
-                    except (ValueError, TypeError, OSError):
-                        pass
+            # Chuyển đổi timestamp 'time' sang datetime với timezone Asia/Ho_Chi_Minh
+            if 'time' in interview and interview.get('time'):
+                try:
+                    timestamp = int(interview['time'])
+                    dt = datetime.fromtimestamp(timestamp, tz=timezone('UTC'))
+                    dt_hcm = dt.astimezone(hcm_tz)
+                    processed_interview['time_dt'] = dt_hcm.isoformat()
+                except (ValueError, TypeError, OSError):
+                    pass
             
             processed_interviews.append(processed_interview)
         
