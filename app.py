@@ -170,11 +170,16 @@ def extract_text_from_pdf(url):
         return None
 
 def extract_text_from_cv_url_with_genai(url):
-    """Trích xuất text từ CV URL bằng Google Gemini AI"""
+    """Trích xuất text từ CV URL, ưu tiên pdfplumber, fallback về Google Gemini AI"""
     if not url:
         return None
     
-    # Thử với API key chính trước
+    # Tạm thời ưu tiên sử dụng pdfplumber trước
+    pdf_text = extract_text_from_pdf(url)
+    if pdf_text:
+        return pdf_text
+    
+    # Nếu pdfplumber không thành công, fallback về Gemini AI
     api_keys_to_try = [GEMINI_API_KEY] + GEMINI_API_KEY_DU_PHONG
     
     for idx, api_key in enumerate(api_keys_to_try):
@@ -234,11 +239,11 @@ def extract_text_from_cv_url_with_genai(url):
             if is_rate_limit and idx < len(api_keys_to_try) - 1:
                 continue
             
-            # Nếu không phải lỗi 429 hoặc đã hết key, tiếp tục thử key tiếp theo hoặc fallback
+            # Nếu không phải lỗi 429 hoặc đã hết key, tiếp tục thử key tiếp theo
             continue
     
-    # Nếu tất cả API keys đều fail, fallback về pdfplumber
-    return extract_text_from_pdf(url)
+    # Nếu tất cả đều fail, trả về None
+    return None
 
 def find_opening_id_by_name(query_name, api_key, similarity_threshold=0.5):
     """Tìm opening_id gần nhất với query_name bằng cosine similarity"""
