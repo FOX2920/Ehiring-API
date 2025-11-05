@@ -393,18 +393,16 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
         return candidates
     return []
 
-def get_interviews(api_key, start_date=None, end_date=None, opening_id=None):
-    """Truy xuất lịch phỏng vấn từ Base API, chỉ trả về các trường quan trọng"""
+def get_interviews(api_key, start_date=None, end_date=None, opening_id=None, filter_date=None):
+    """Truy xuất lịch phỏng vấn từ Base API, chỉ trả về các trường quan trọng. Lọc dựa trên date của time_dt nếu có filter_date."""
     url = "https://hiring.base.vn/publicapi/v2/interview/list"
     
     payload = {
         'access_token': api_key,
     }
     
-    if start_date:
-        payload['start_date'] = start_date.strftime('%Y-%m-%d') if isinstance(start_date, date) else start_date
-    if end_date:
-        payload['end_date'] = end_date.strftime('%Y-%m-%d') if isinstance(end_date, date) else end_date
+    # Không truyền start_date/end_date vào API Base, sẽ lọc sau khi chuyển đổi time_dt
+    # Chỉ dùng để API Base lọc sơ bộ nếu cần
     
     headers = {'Content-Type': 'application/x-www-form-urlencoded'}
     
@@ -440,14 +438,21 @@ def get_interviews(api_key, start_date=None, end_date=None, opening_id=None):
             }
             
             # Chuyển đổi timestamp 'time' sang datetime với timezone Asia/Ho_Chi_Minh
+            time_dt_date = None
             if 'time' in interview and interview.get('time'):
                 try:
                     timestamp = int(interview['time'])
                     dt = datetime.fromtimestamp(timestamp, tz=timezone('UTC'))
                     dt_hcm = dt.astimezone(hcm_tz)
                     processed_interview['time_dt'] = dt_hcm.isoformat()
+                    time_dt_date = dt_hcm.date()  # Lấy date để lọc
                 except (ValueError, TypeError, OSError):
                     pass
+            
+            # Lọc dựa trên date của time_dt
+            if filter_date:
+                if time_dt_date is None or time_dt_date != filter_date:
+                    continue  # Bỏ qua nếu không có time_dt hoặc date không khớp
             
             processed_interviews.append(processed_interview)
         
@@ -683,24 +688,13 @@ async def get_interviews_by_opening(
     start_date: Optional[str] = Query(None, description="Ngày bắt đầu lọc lịch phỏng vấn (YYYY-MM-DD). Bỏ trống để lấy tất cả."),
     end_date: Optional[str] = Query(None, description="Ngày kết thúc lọc lịch phỏng vấn (YYYY-MM-DD). Bỏ trống để lấy tất cả.")
 ):
-    """Lấy lịch phỏng vấn, có thể lọc theo opening_name hoặc opening_id (tự động tìm bằng cosine similarity). Có thể lấy cho 1 ngày cụ thể bằng tham số date."""
+    """Lấy lịch phỏng vấn, có thể lọc theo opening_name hoặc opening_id (tự động tìm bằng cosine similarity). Có thể lấy cho 1 ngày cụ thể bằng tham số date. Lọc dựa trên date của time_dt."""
     try:
-        start_date_obj, end_date_obj = None, None
+        filter_date_obj = None
         
-        # Nếu có tham số date, dùng nó làm cả start_date và end_date
+        # Nếu có tham số date, dùng nó để lọc dựa trên time_dt
         if date:
-            date_obj = datetime.strptime(date, "%Y-%m-%d").date()
-            start_date_obj = date_obj
-            end_date_obj = date_obj
-        else:
-            # Nếu không có date, dùng start_date và end_date như bình thường
-            if start_date:
-                start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
-            if end_date:
-                end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
-            
-            if start_date_obj and end_date_obj and start_date_obj > end_date_obj:
-                raise HTTPException(status_code=400, detail="Ngày kết thúc phải sau ngày bắt đầu")
+            filter_date_obj = datetime.strptime(date, "%Y-%m-%d").date()
         
         opening_id = None
         matched_name = None
@@ -717,7 +711,8 @@ async def get_interviews_by_opening(
                 # Nếu không tìm thấy, vẫn trả về tất cả interviews nhưng có thông báo
                 opening_id = None
         
-        interviews = get_interviews(BASE_API_KEY, start_date_obj, end_date_obj, opening_id)
+        # Lấy tất cả interviews và lọc dựa trên date của time_dt
+        interviews = get_interviews(BASE_API_KEY, opening_id=opening_id, filter_date=filter_date_obj)
         
         return {
             "success": True,
