@@ -679,19 +679,28 @@ async def get_candidates_by_opening(
 @app.get("/api/interviews", operation_id="layLichPhongVan")
 async def get_interviews_by_opening(
     opening_name_or_id: Optional[str] = Query(None, description="Tên hoặc ID của vị trí tuyển dụng để lọc. Bỏ trống để lấy tất cả."),
+    date: Optional[str] = Query(None, description="Lấy lịch phỏng vấn cho 1 ngày cụ thể (YYYY-MM-DD). Nếu có tham số này, sẽ bỏ qua start_date và end_date."),
     start_date: Optional[str] = Query(None, description="Ngày bắt đầu lọc lịch phỏng vấn (YYYY-MM-DD). Bỏ trống để lấy tất cả."),
     end_date: Optional[str] = Query(None, description="Ngày kết thúc lọc lịch phỏng vấn (YYYY-MM-DD). Bỏ trống để lấy tất cả.")
 ):
-    """Lấy lịch phỏng vấn, có thể lọc theo opening_name hoặc opening_id (tự động tìm bằng cosine similarity)"""
+    """Lấy lịch phỏng vấn, có thể lọc theo opening_name hoặc opening_id (tự động tìm bằng cosine similarity). Có thể lấy cho 1 ngày cụ thể bằng tham số date."""
     try:
         start_date_obj, end_date_obj = None, None
-        if start_date:
-            start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
-        if end_date:
-            end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
         
-        if start_date_obj and end_date_obj and start_date_obj > end_date_obj:
-            raise HTTPException(status_code=400, detail="Ngày kết thúc phải sau ngày bắt đầu")
+        # Nếu có tham số date, dùng nó làm cả start_date và end_date
+        if date:
+            date_obj = datetime.strptime(date, "%Y-%m-%d").date()
+            start_date_obj = date_obj
+            end_date_obj = date_obj
+        else:
+            # Nếu không có date, dùng start_date và end_date như bình thường
+            if start_date:
+                start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
+            if end_date:
+                end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
+            
+            if start_date_obj and end_date_obj and start_date_obj > end_date_obj:
+                raise HTTPException(status_code=400, detail="Ngày kết thúc phải sau ngày bắt đầu")
         
         opening_id = None
         matched_name = None
@@ -713,6 +722,7 @@ async def get_interviews_by_opening(
         return {
             "success": True,
             "query": opening_name_or_id,
+            "date": date,
             "opening_id": opening_id,
             "opening_name": matched_name,
             "similarity_score": similarity_score,
