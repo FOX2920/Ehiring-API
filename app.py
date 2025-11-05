@@ -446,6 +446,79 @@ def get_interviews(api_key, start_date=None, end_date=None, opening_id=None):
     
     return []
 
+def get_candidate_details(candidate_id, api_key):
+    """Lấy và xử lý dữ liệu chi tiết ứng viên từ API Base.vn, trả về JSON phẳng"""
+    url = "https://hiring.base.vn/publicapi/v2/candidate/get"
+    
+    payload = {
+        'access_token': api_key,
+        'id': candidate_id
+    }
+    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+    
+    try:
+        response = requests.post(url, headers=headers, data=payload, timeout=15)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=503, detail=f"Lỗi kết nối đến Base API khi lấy chi tiết ứng viên: {e}")
+    
+    raw_response = response.json()
+    
+    # Kiểm tra API có trả về lỗi logic không (vd: 'code': 1 là thành công)
+    if raw_response.get('code') != 1 or not raw_response.get('candidate'):
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Không tìm thấy ứng viên với ID '{candidate_id}'. {raw_response.get('message', '')}"
+        )
+    
+    # Lấy dữ liệu gốc của ứng viên
+    candidate_data = raw_response.get('candidate', {})
+    
+    # Hàm trợ giúp để "làm phẳng" các danh sách lồng nhau
+    def flatten_fields(field_list):
+        """Chuyển đổi danh sách [{'id': 'key1', 'value': 'val1'}, ...] thành {'key1': 'val1', ...}"""
+        flat_dict = {}
+        if isinstance(field_list, list):
+            for item in field_list:
+                if isinstance(item, dict) and 'id' in item:
+                    flat_dict[item['id']] = item.get('value')
+        return flat_dict
+    
+    # Bắt đầu với các trường dữ liệu chính
+    refined_data = {
+        'id': candidate_data.get('id'),
+        'ten': candidate_data.get('name'),
+        'email': candidate_data.get('email'),
+        'so_dien_thoai': candidate_data.get('phone'),
+        
+        # Lấy tên vị trí tuyển dụng chính xác từ 'evaluations'
+        'vi_tri_ung_tuyen': (candidate_data.get('evaluations') or [{}])[0].get('opening_export', {}).get('name', candidate_data.get('title')),
+        
+        # Lấy opening_id từ evaluations nếu có
+        'opening_id': (candidate_data.get('evaluations') or [{}])[0].get('opening_export', {}).get('id'),
+        
+        # Lấy stage_id và stage_name
+        'stage_id': candidate_data.get('stage_id'),
+        'stage_name': candidate_data.get('stage_name', candidate_data.get('status')),
+        
+        'nguon_ung_vien': candidate_data.get('source'),
+        'ngay_sinh': candidate_data.get('dob'),
+        'gioi_tinh': candidate_data.get('gender_text'),
+        'dia_chi_hien_tai': candidate_data.get('address'),
+        'cccd': candidate_data.get('ssn'),
+        'cv_url': (candidate_data.get('cvs') or [None])[0]
+    }
+    
+    # Xử lý và gộp dữ liệu từ 'fields' và 'form'
+    field_data = flatten_fields(candidate_data.get('fields', []))
+    form_data = flatten_fields(candidate_data.get('form', []))
+    
+    # Cập nhật vào dict chính
+    refined_data.update(field_data)
+    refined_data.update(form_data)
+    
+    return refined_data
+
 # =================================================================
 # Request/Response Models
 # =================================================================
@@ -482,7 +555,8 @@ async def root():
         "endpoints": {
             "get_candidates": "/api/opening/{opening_name_or_id}/candidates",
             "get_job_description": "/api/opening/{opening_name_or_id}/job-description",
-            "get_interviews": "/api/interviews"
+            "get_interviews": "/api/interviews",
+            "get_candidate_details": "/api/candidate/{candidate_id}"
         },
         "note": "Có thể sử dụng opening_name hoặc opening_id. Hệ thống sẽ tự động tìm opening gần nhất bằng cosine similarity nếu dùng name."
     }
@@ -642,6 +716,59 @@ async def get_interviews_by_opening(
         raise HTTPException(status_code=400, detail=f"Định dạng ngày không hợp lệ: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi khi lấy lịch phỏng vấn: {str(e)}")
+
+@app.get("/api/candidate/{candidate_id}", operation_id="layChiTietUngVien")
+async def get_candidate_details_endpoint(
+    candidate_id: str = Path(..., description="ID của ứng viên")
+):
+    """Lấy chi tiết ứng viên theo candidate_id. Tự động trích xuất cv_text từ cv_url bằng Gemini AI và thêm JD dựa trên opening name."""
+    try:
+        # Lấy dữ liệu chi tiết ứng viên
+        candidate_data = get_candidate_details(candidate_id, BASE_API_KEY)
+        
+        # Trích xuất cv_text từ cv_url nếu có
+        cv_url = candidate_data.get('cv_url')
+        cv_text = None
+        if cv_url:
+            cv_text = extract_text_from_cv_url_with_genai(cv_url)
+            candidate_data['cv_text'] = cv_text
+        
+        # Lấy JD dựa trên opening name
+        opening_name = candidate_data.get('vi_tri_ung_tuyen')
+        opening_id = candidate_data.get('opening_id')
+        job_description = None
+        
+        if opening_name or opening_id:
+            # Tìm opening_id nếu chỉ có opening_name
+            if not opening_id and opening_name:
+                opening_id, matched_name, similarity_score = find_opening_id_by_name(
+                    opening_name,
+                    BASE_API_KEY
+                )
+            
+            # Lấy JD nếu có opening_id
+            if opening_id:
+                jds = get_job_descriptions(BASE_API_KEY, use_cache=True)
+                jd = next((jd for jd in jds if jd['id'] == opening_id), None)
+                
+                if not jd:
+                    # Thử làm mới cache nếu không tìm thấy
+                    jds = get_job_descriptions(BASE_API_KEY, use_cache=False)
+                    jd = next((jd for jd in jds if jd['id'] == opening_id), None)
+                
+                if jd:
+                    job_description = jd['job_description']
+                    candidate_data['job_description'] = job_description
+        
+        return {
+            "success": True,
+            "candidate_id": candidate_id,
+            "candidate_details": candidate_data
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy chi tiết ứng viên: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
