@@ -10,6 +10,10 @@ import requests
 from bs4 import BeautifulSoup
 import os
 from time import time
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 import pdfplumber
 from io import BytesIO
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -18,6 +22,15 @@ import numpy as np
 from google import genai
 from google.genai import types
 from pytz import timezone
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+import time as time_module
+
 app = FastAPI(
     title="Base Hiring API - JD và CV Extractor",
     description="API để trích xuất dữ liệu JD (Job Description) và CV từ Base Hiring API",
@@ -45,6 +58,10 @@ if not GEMINI_API_KEY:
 # Parse GEMINI_API_KEY_DU_PHONG từ string (comma-separated) sang list
 GEMINI_API_KEY_DU_PHONG_STR = os.getenv('GEMINI_API_KEY_DU_PHONG', '')
 GEMINI_API_KEY_DU_PHONG = [key.strip() for key in GEMINI_API_KEY_DU_PHONG_STR.split(',') if key.strip()] if GEMINI_API_KEY_DU_PHONG_STR else []
+
+# Base.vn Login Credentials (for test data extraction)
+BASE_EMAIL = os.getenv('BASE_EMAIL')
+BASE_PASSWORD = os.getenv('BASE_PASSWORD')
 
 # Cache configuration
 CACHE_TTL = 300  # 5 phút cache
@@ -378,6 +395,9 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
                     if isinstance(item, dict) and 'id' in item and 'value' in item:
                         form_data[item['id']] = item['value']
             
+            # Lấy test data
+            test_data = get_candidate_test_data(opening_id, candidate.get('id'))
+            
             candidate_info = {
                 "id": candidate.get('id'),
                 "name": candidate.get('name'),
@@ -390,7 +410,8 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
                 "form_data": form_data,
                 "opening_id": opening_id,
                 "stage_id": candidate.get('stage_id'),
-                "stage_name": candidate.get('stage_name')
+                "stage_name": candidate.get('stage_name'),
+                "test_data": test_data
             }
             
             candidates.append(candidate_info)
@@ -464,6 +485,179 @@ def get_interviews(api_key, start_date=None, end_date=None, opening_id=None, fil
         return processed_interviews
     
     return []
+
+def get_candidate_test_data(opening_id, candidate_id):
+    """Lấy dữ liệu bài test của ứng viên từ trang Base.vn bằng Selenium"""
+    if not BASE_EMAIL or not BASE_PASSWORD:
+        return None
+    
+    driver = None
+    try:
+        # Khởi tạo WebDriver
+        chrome_options = Options()
+        chrome_options.add_argument('--headless')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--window-size=1920,1080')
+
+        # BỎ 'service=Service(ChromeDriverManager().install())'
+        # Khi cài Chrome/ChromeDriver trong Docker, Selenium sẽ tự động tìm trong PATH
+        driver = webdriver.Chrome(options=chrome_options)
+        
+        # Tạo URL đăng nhập với return URL
+        target_url = f"https://hiring.base.vn/opening/{opening_id}?candidate={candidate_id}"
+        login_url = f"https://account.base.vn/a/login?app=hiring&return=opening%2F{opening_id}%3Fcandidate%3D{candidate_id}"
+        
+        # Đăng nhập
+        driver.get(login_url)
+        wait = WebDriverWait(driver, 15)
+        
+        # Điền email
+        email_input = wait.until(EC.presence_of_element_located((By.NAME, "email")))
+        email_input.clear()
+        email_input.send_keys(BASE_EMAIL)
+        time_module.sleep(1)
+        
+        # Điền password
+        password_input = None
+        password_selectors = [
+            (By.NAME, "login-password"),
+            (By.ID, "login-password"),
+            (By.ID, "password"),
+            (By.NAME, "password"),
+            (By.CSS_SELECTOR, "input[type='password']"),
+        ]
+        
+        for selector_type, selector_value in password_selectors:
+            try:
+                password_input = wait.until(EC.presence_of_element_located((selector_type, selector_value)))
+                break
+            except:
+                continue
+        
+        if password_input is None:
+            return None
+        
+        password_input.clear()
+        password_input.send_keys(BASE_PASSWORD)
+        
+        # Nhấn nút đăng nhập
+        login_button = None
+        button_selectors = [
+            (By.XPATH, "//button[@type='submit']"),
+            (By.CSS_SELECTOR, "button[type='submit']"),
+            (By.XPATH, "//button[contains(text(), 'Đăng nhập')]"),
+            (By.XPATH, "//button[contains(text(), 'Login')]"),
+        ]
+        
+        for selector_type, selector_value in button_selectors:
+            try:
+                login_button = driver.find_element(selector_type, selector_value)
+                if login_button.is_displayed():
+                    login_button.click()
+                    break
+            except:
+                continue
+        
+        if login_button is None:
+            password_input.send_keys(Keys.RETURN)
+        
+        # Đợi đăng nhập hoàn tất
+        time_module.sleep(3)
+        
+        # Điều hướng đến trang mục tiêu nếu chưa ở đó
+        current_url = driver.current_url
+        if target_url not in current_url:
+            driver.get(target_url)
+        
+        wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time_module.sleep(2)
+        
+        # Parse HTML để lấy dữ liệu test
+        page_source = driver.page_source
+        soup = BeautifulSoup(page_source, 'html.parser')
+        
+        # Tìm phần "Kết quả bài kiểm tra"
+        test_result_section = None
+        title_elements = soup.find_all(string=lambda text: text and "Kết quả bài kiểm tra" in text.strip())
+        
+        if title_elements:
+            for title_elem in title_elements:
+                parent = title_elem.find_parent()
+                if parent:
+                    section = parent.find_parent(class_='events')
+                    if section:
+                        test_result_section = section
+                        break
+                    if parent.find_parent(class_='body'):
+                        test_result_section = parent.find_parent(class_='body')
+                        break
+        
+        if test_result_section is None:
+            events_sections = soup.find_all('div', class_='events')
+            for section in events_sections:
+                title_div = section.find('div', class_='title')
+                if title_div and "Kết quả bài kiểm tra" in title_div.get_text():
+                    test_result_section = section
+                    break
+        
+        if not test_result_section:
+            return None
+        
+        # Trích xuất dữ liệu từ bảng test-results
+        test_table = test_result_section.find('table', class_='test-results')
+        if not test_table:
+            return None
+        
+        test_rows = test_table.find_all('tr', class_='test-result')
+        test_data = []
+        
+        for row in test_rows:
+            cells = row.find_all('td')
+            if len(cells) >= 5:
+                name_cell = cells[0].find('div', class_='name')
+                test_name = name_cell.get_text(strip=True) if name_cell else ""
+                
+                score_cell = cells[1].find('div', class_='score')
+                score = score_cell.get_text(strip=True) if score_cell else ""
+                
+                time_cell = cells[2].find('div', class_='time')
+                test_time = time_cell.get_text(strip=True) if time_cell else ""
+                
+                link_cell = cells[4].find('div', class_='actions')
+                link = ""
+                if link_cell:
+                    link_tag = link_cell.find('a')
+                    if link_tag:
+                        link = link_tag.get('href', '')
+                
+                test_data.append({
+                    'test_name': test_name,
+                    'score': score,
+                    'time': test_time,
+                    'link': link,
+                    'test_content': None  # Sẽ được điền sau nếu cần
+                })
+        
+        # Lấy nội dung chi tiết từ các link (tùy chọn, có thể bỏ qua để tăng tốc)
+        # for test_item in test_data:
+        #     if test_item['link']:
+        #         # Có thể implement logic lấy test_content từ link ở đây nếu cần
+        #         pass
+        
+        return test_data if test_data else None
+        
+    except Exception as e:
+        # Log lỗi nhưng không raise để không làm gián đoạn flow chính
+        print(f"Lỗi khi lấy test data cho candidate {candidate_id}: {str(e)}")
+        return None
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except:
+                pass
 
 def get_candidate_details(candidate_id, api_key):
     """Lấy và xử lý dữ liệu chi tiết ứng viên từ API Base.vn, trả về JSON phẳng"""
@@ -765,19 +959,25 @@ async def get_candidate_details_endpoint(
                     BASE_API_KEY
                 )
             
-            # Lấy JD nếu có opening_id
-            if opening_id:
-                jds = get_job_descriptions(BASE_API_KEY, use_cache=True)
+        # Lấy JD nếu có opening_id
+        if opening_id:
+            jds = get_job_descriptions(BASE_API_KEY, use_cache=True)
+            jd = next((jd for jd in jds if jd['id'] == opening_id), None)
+            
+            if not jd:
+                # Thử làm mới cache nếu không tìm thấy
+                jds = get_job_descriptions(BASE_API_KEY, use_cache=False)
                 jd = next((jd for jd in jds if jd['id'] == opening_id), None)
-                
-                if not jd:
-                    # Thử làm mới cache nếu không tìm thấy
-                    jds = get_job_descriptions(BASE_API_KEY, use_cache=False)
-                    jd = next((jd for jd in jds if jd['id'] == opening_id), None)
-                
-                if jd:
-                    job_description = jd['job_description']
-                    candidate_data['job_description'] = job_description
+            
+            if jd:
+                job_description = jd['job_description']
+                candidate_data['job_description'] = job_description
+        
+        # Lấy test data (chỉ khi có opening_id)
+        test_data = None
+        if opening_id:
+            test_data = get_candidate_test_data(opening_id, candidate_id)
+        candidate_data['test_data'] = test_data
         
         return {
             "success": True,
