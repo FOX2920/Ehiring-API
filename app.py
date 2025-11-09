@@ -46,6 +46,9 @@ if not GEMINI_API_KEY:
 GEMINI_API_KEY_DU_PHONG_STR = os.getenv('GEMINI_API_KEY_DU_PHONG', '')
 GEMINI_API_KEY_DU_PHONG = [key.strip() for key in GEMINI_API_KEY_DU_PHONG_STR.split(',') if key.strip()] if GEMINI_API_KEY_DU_PHONG_STR else []
 
+# Google Sheet Script URL (optional) - để lấy dữ liệu bài test
+GOOGLE_SHEET_SCRIPT_URL = os.getenv('GOOGLE_SHEET_SCRIPT_URL', None)
+
 # Cache configuration
 CACHE_TTL = 300  # 5 phút cache
 _cache = {
@@ -378,6 +381,9 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
                     if isinstance(item, dict) and 'id' in item and 'value' in item:
                         form_data[item['id']] = item['value']
             
+            # Lấy dữ liệu bài test từ Google Sheet
+            test_results = get_test_results_from_google_sheet(candidate.get('id'))
+            
             candidate_info = {
                 "id": candidate.get('id'),
                 "name": candidate.get('name'),
@@ -390,7 +396,8 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
                 "form_data": form_data,
                 "opening_id": opening_id,
                 "stage_id": candidate.get('stage_id'),
-                "stage_name": candidate.get('stage_name')
+                "stage_name": candidate.get('stage_name'),
+                "test_results": test_results
             }
             
             candidates.append(candidate_info)
@@ -464,6 +471,47 @@ def get_interviews(api_key, start_date=None, end_date=None, opening_id=None, fil
         return processed_interviews
     
     return []
+
+def get_test_results_from_google_sheet(candidate_id):
+    """Lấy dữ liệu bài test của ứng viên từ Google Sheet"""
+    if not GOOGLE_SHEET_SCRIPT_URL:
+        return None
+    
+    try:
+        payload = {
+            'action': 'read_data',
+            'filters': {
+                'candidate_id': str(candidate_id)
+            }
+        }
+        
+        response = requests.post(
+            GOOGLE_SHEET_SCRIPT_URL,
+            json=payload,
+            timeout=10
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        if result.get('success') and result.get('data'):
+            # Trả về danh sách bài test của ứng viên
+            test_results = []
+            for item in result.get('data', []):
+                test_result = {
+                    'test_name': item.get('Tên bài test', ''),
+                    'score': item.get('Score', ''),
+                    'time': item.get('Time', ''),
+                    'link': item.get('Link', ''),
+                    'test_content': item.get('test content', '')
+                }
+                test_results.append(test_result)
+            return test_results if test_results else None
+        
+        return None
+    except Exception as e:
+        # Nếu có lỗi, trả về None (không làm gián đoạn flow chính)
+        return None
 
 def get_candidate_details(candidate_id, api_key):
     """Lấy và xử lý dữ liệu chi tiết ứng viên từ API Base.vn, trả về JSON phẳng"""
@@ -547,6 +595,13 @@ class JobDescriptionResponse(BaseModel):
     name: str
     job_description: str
 
+class TestResult(BaseModel):
+    test_name: Optional[str]
+    score: Optional[str]
+    time: Optional[str]
+    link: Optional[str]
+    test_content: Optional[str]
+
 class CandidateResponse(BaseModel):
     id: str
     name: str
@@ -560,6 +615,7 @@ class CandidateResponse(BaseModel):
     opening_id: str
     stage_id: Optional[str]
     stage_name: Optional[str]
+    test_results: Optional[list[TestResult]]
 
 # =================================================================
 # API Endpoints
@@ -751,6 +807,10 @@ async def get_candidate_details_endpoint(
         if cv_url:
             cv_text = extract_text_from_cv_url_with_genai(cv_url)
             candidate_data['cv_text'] = cv_text
+        
+        # Lấy dữ liệu bài test từ Google Sheet
+        test_results = get_test_results_from_google_sheet(candidate_id)
+        candidate_data['test_results'] = test_results
         
         # Lấy JD dựa trên opening name
         opening_name = candidate_data.get('vi_tri_ung_tuyen')
