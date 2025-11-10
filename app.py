@@ -518,24 +518,47 @@ def find_opening_id_by_name(query_name, api_key, similarity_threshold=0.5):
         return None, None, 0.0
 
 def find_candidate_by_name_in_opening(candidate_name, opening_id, api_key, similarity_threshold=0.5):
-    """Tìm candidate_id dựa trên tên ứng viên trong một opening cụ thể bằng cosine similarity"""
+    """Tìm candidate_id dựa trên tên ứng viên trong một opening cụ thể bằng cosine similarity. Chỉ tìm trong các stage 'Offered' và 'Hired' để tối ưu tốc độ."""
     if not candidate_name or not opening_id:
         return None, 0.0
     
-    # Lấy danh sách candidates của opening đó
-    candidates = get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=None, stage_name=None)
+    # Lấy danh sách candidates của opening đó (chưa lọc stage)
+    url = "https://hiring.base.vn/publicapi/v2/candidate/list"
+    payload = {
+        'access_token': api_key,
+        'opening_id': opening_id,
+    }
+    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
     
-    if not candidates:
+    try:
+        response = requests.post(url, headers=headers, data=payload, timeout=15)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
         return None, 0.0
     
-    # Tìm candidate bằng tên với cosine similarity
-    candidate_names = [c.get('name', '') for c in candidates if c.get('name')]
+    data = response.json()
+    if 'candidates' not in data or not data['candidates']:
+        return None, 0.0
+    
+    # Lọc chỉ lấy candidates ở stage "Offered" hoặc "Hired" (case-insensitive)
+    target_stages = ['Offered', 'Hired']
+    filtered_candidates = []
+    for candidate in data['candidates']:
+        stage_name = candidate.get('stage_name', '')
+        if stage_name and stage_name in target_stages:
+            filtered_candidates.append(candidate)
+    
+    if not filtered_candidates:
+        return None, 0.0
+    
+    # Tìm candidate bằng tên với cosine similarity trong danh sách đã lọc
+    candidate_names = [c.get('name', '') for c in filtered_candidates if c.get('name')]
     
     if not candidate_names:
         return None, 0.0
     
     # Kiểm tra exact match trước
-    exact_match = next((c for c in candidates if c.get('name') == candidate_name), None)
+    exact_match = next((c for c in filtered_candidates if c.get('name') == candidate_name), None)
     if exact_match:
         return exact_match.get('id'), 1.0
     
@@ -551,7 +574,7 @@ def find_candidate_by_name_in_opening(candidate_name, opening_id, api_key, simil
         
         # Nếu similarity >= threshold, trả về candidate đó
         if best_similarity >= similarity_threshold:
-            candidates_with_names = [c for c in candidates if c.get('name')]
+            candidates_with_names = [c for c in filtered_candidates if c.get('name')]
             if best_idx < len(candidates_with_names):
                 best_candidate = candidates_with_names[best_idx]
                 return best_candidate.get('id'), float(best_similarity)
