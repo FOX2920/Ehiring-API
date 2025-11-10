@@ -18,6 +18,8 @@ import numpy as np
 from google import genai
 from google.genai import types
 from pytz import timezone
+import re
+from html import unescape
 app = FastAPI(
     title="Base Hiring API - JD và CV Extractor",
     description="API để trích xuất dữ liệu JD (Job Description) và CV từ Base Hiring API",
@@ -49,11 +51,15 @@ GEMINI_API_KEY_DU_PHONG = [key.strip() for key in GEMINI_API_KEY_DU_PHONG_STR.sp
 # Google Sheet Script URL (optional) - để lấy dữ liệu bài test
 GOOGLE_SHEET_SCRIPT_URL = os.getenv('GOOGLE_SHEET_SCRIPT_URL', None)
 
+# Account API Key (optional) - để lấy thông tin users cho reviews
+ACCOUNT_API_KEY = os.getenv('ACCOUNT_API_KEY', None)
+
 # Cache configuration
 CACHE_TTL = 300  # 5 phút cache
 _cache = {
     'openings': {'data': None, 'timestamp': 0},
-    'job_descriptions': {'data': None, 'timestamp': 0}
+    'job_descriptions': {'data': None, 'timestamp': 0},
+    'users_info': {'data': None, 'timestamp': 0}
 }
 
 # =================================================================
@@ -152,6 +158,96 @@ def extract_message(evaluations):
         text = " ".join(soup.stripped_strings)
         return text
     return None
+
+def remove_html_tags(text):
+    """Bỏ HTML tags và chuyển đổi thành text thuần túy"""
+    if not text:
+        return ""
+    # Chuyển các thẻ <br> thành xuống dòng
+    text = re.sub(r'<br\s*/?>', '\n', text)
+    # Bỏ tất cả các thẻ HTML còn lại
+    text = re.sub(r'<[^>]+>', '', text)
+    # Unescape các ký tự HTML entities (&lt;, &gt;, &amp;, etc.)
+    text = unescape(text)
+    # Loại bỏ các khoảng trắng thừa
+    text = re.sub(r'\n\s*\n', '\n', text)
+    return text.strip()
+
+def get_users_info(use_cache=True):
+    """Lấy thông tin users từ Account API và map username -> name + title (có cache)"""
+    if not ACCOUNT_API_KEY:
+        return {}
+    
+    current_time = time()
+    
+    # Kiểm tra cache
+    if use_cache and _cache['users_info']['data'] is not None:
+        if current_time - _cache['users_info']['timestamp'] < CACHE_TTL:
+            return _cache['users_info']['data']
+    
+    try:
+        users_url = "https://account.base.vn/extapi/v1/users"
+        users_payload = {'access_token': ACCOUNT_API_KEY}
+        users_response = requests.post(users_url, data=users_payload, timeout=10)
+        users_response.raise_for_status()
+        users_data = users_response.json()
+        
+        # Tạo dictionary để map username -> name + title
+        username_to_info = {}
+        if 'users' in users_data and isinstance(users_data['users'], list):
+            for user in users_data['users']:
+                username = user.get('username')
+                name = user.get('name', '')
+                title = user.get('title', '')
+                if username:
+                    # Nếu là Hoang Tran thì thay title thành CEO
+                    if name == "Hoang Tran":
+                        title = "CEO"
+                    
+                    # Kết hợp name và title
+                    if title:
+                        username_to_info[username] = {"name": name, "title": title}
+                    else:
+                        username_to_info[username] = {"name": name, "title": ""}
+        
+        # Lưu vào cache
+        if use_cache:
+            _cache['users_info'] = {'data': username_to_info, 'timestamp': current_time}
+        
+        return username_to_info
+    except Exception as e:
+        # Nếu có lỗi, trả về dict rỗng
+        return {}
+
+def process_evaluations(evaluations):
+    """Xử lý evaluations và trả về danh sách reviews với đầy đủ thông tin (tên, chức danh, nội dung)"""
+    if not isinstance(evaluations, list) or len(evaluations) == 0:
+        return []
+    
+    # Lấy thông tin users
+    username_to_info = get_users_info(use_cache=True)
+    
+    reviews = []
+    for eval_item in evaluations:
+        if 'content' in eval_item:
+            # Bỏ HTML tags
+            clean_content = remove_html_tags(eval_item.get('content', ''))
+            
+            # Lấy username và chuyển thành tên thật + chức danh
+            username = eval_item.get('username')
+            user_info = username_to_info.get(username, {}) if username else {}
+            name = user_info.get('name', username) if user_info else (username if username else "N/A")
+            title = user_info.get('title', '') if user_info else ''
+            
+            review = {
+                "id": eval_item.get('id'),
+                "name": name,
+                "title": title,
+                "content": clean_content
+            }
+            reviews.append(review)
+    
+    return reviews
 
 def extract_text_from_pdf(url):
     """Trích xuất text từ PDF URL bằng pdfplumber (fallback method)"""
@@ -373,6 +469,9 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
             if cv_url:
                 cv_text = extract_text_from_cv_url_with_genai(cv_url)
             
+            # Xử lý evaluations để lấy reviews chi tiết
+            reviews = process_evaluations(candidate.get('evaluations', []))
+            # Giữ lại review cũ (text đơn giản) để tương thích ngược
             review = extract_message(candidate.get('evaluations', []))
             
             form_data = {}
@@ -392,7 +491,8 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
                 "gender": candidate.get('gender'),
                 "cv_url": cv_url,
                 "cv_text": cv_text,
-                "review": review,
+                "review": review,  # Giữ lại để tương thích ngược
+                "reviews": reviews,  # Danh sách reviews chi tiết với tên, chức danh, nội dung
                 "form_data": form_data,
                 "opening_id": opening_id,
                 "stage_id": candidate.get('stage_id'),
@@ -584,6 +684,10 @@ def get_candidate_details(candidate_id, api_key):
     refined_data.update(field_data)
     refined_data.update(form_data)
     
+    # Xử lý evaluations để lấy reviews chi tiết
+    reviews = process_evaluations(candidate_data.get('evaluations', []))
+    refined_data['reviews'] = reviews
+    
     return refined_data
 
 # =================================================================
@@ -602,6 +706,12 @@ class TestResult(BaseModel):
     link: Optional[str]
     test_content: Optional[str]
 
+class Review(BaseModel):
+    id: Optional[str]
+    name: str
+    title: str
+    content: str
+
 class CandidateResponse(BaseModel):
     id: str
     name: str
@@ -611,6 +721,7 @@ class CandidateResponse(BaseModel):
     cv_url: Optional[str]
     cv_text: Optional[str]
     review: Optional[str]
+    reviews: Optional[list[Review]]
     form_data: dict
     opening_id: str
     stage_id: Optional[str]
