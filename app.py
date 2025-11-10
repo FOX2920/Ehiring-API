@@ -945,7 +945,7 @@ async def root():
             "get_candidates": "/api/opening/{opening_name_or_id}/candidates",
             "get_job_description": "/api/opening/{opening_name_or_id}/job-description",
             "get_interviews": "/api/interviews",
-            "get_candidate_details": "/api/candidate/{candidate_id}",
+            "get_candidate_details": "/api/candidate",
             "get_offer_letter": "/api/offer-letter"
         },
         "note": "Có thể sử dụng opening_name hoặc opening_id. Hệ thống sẽ tự động tìm opening gần nhất bằng cosine similarity nếu dùng name."
@@ -1107,14 +1107,56 @@ async def get_interviews_by_opening(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi khi lấy lịch phỏng vấn: {str(e)}")
 
-@app.get("/api/candidate/{candidate_id}", operation_id="layChiTietUngVien")
+@app.get("/api/candidate", operation_id="layChiTietUngVien")
 async def get_candidate_details_endpoint(
-    candidate_id: str = Path(..., description="ID của ứng viên")
+    candidate_id: Optional[str] = Query(None, description="ID của ứng viên. Bắt buộc nếu không có opening_name_or_id và candidate_name."),
+    opening_name_or_id: Optional[str] = Query(None, description="Tên hoặc ID của vị trí tuyển dụng để tìm kiếm bằng cosine similarity. Bắt buộc nếu không có candidate_id."),
+    candidate_name: Optional[str] = Query(None, description="Tên ứng viên để tìm kiếm bằng cosine similarity trong opening. Bắt buộc nếu không có candidate_id.")
 ):
-    """Lấy chi tiết ứng viên theo candidate_id. Tự động trích xuất cv_text từ cv_url bằng Gemini AI và thêm JD dựa trên opening name."""
+    """Lấy chi tiết ứng viên. Có thể tìm bằng candidate_id, hoặc bằng opening_name_or_id + candidate_name (dùng cosine similarity). Tự động trích xuất cv_text từ cv_url bằng Gemini AI và thêm JD dựa trên opening name."""
     try:
+        found_candidate_id = candidate_id
+        opening_id = None
+        opening_name_matched = None
+        opening_similarity = None
+        candidate_similarity = None
+        
+        # Nếu không có candidate_id, phải có cả opening_name_or_id và candidate_name
+        if not found_candidate_id:
+            if not opening_name_or_id or not candidate_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Phải cung cấp candidate_id, hoặc cả opening_name_or_id và candidate_name"
+                )
+            
+            # Tìm opening_id từ opening_name_or_id bằng cosine similarity
+            opening_id, opening_name_matched, opening_similarity = find_opening_id_by_name(
+                opening_name_or_id,
+                BASE_API_KEY
+            )
+            
+            if not opening_id:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Không tìm thấy vị trí phù hợp với '{opening_name_or_id}'. Similarity score cao nhất: {opening_similarity:.2f}"
+                )
+            
+            # Tìm candidate trong opening đó bằng tên với cosine similarity
+            found_candidate_id, candidate_similarity = find_candidate_by_name_in_opening(
+                candidate_name,
+                opening_id,
+                BASE_API_KEY,
+                similarity_threshold=0.5
+            )
+            
+            if not found_candidate_id:
+                error_msg = f"Không tìm thấy ứng viên phù hợp với tên '{candidate_name}' trong vị trí '{opening_name_matched}'. "
+                if candidate_similarity is not None:
+                    error_msg += f"Candidate similarity score cao nhất: {candidate_similarity:.2f}"
+                raise HTTPException(status_code=404, detail=error_msg)
+        
         # Lấy dữ liệu chi tiết ứng viên
-        candidate_data = get_candidate_details(candidate_id, BASE_API_KEY)
+        candidate_data = get_candidate_details(found_candidate_id, BASE_API_KEY)
         
         # Trích xuất cv_text từ cv_url nếu có
         cv_url = candidate_data.get('cv_url')
@@ -1154,11 +1196,21 @@ async def get_candidate_details_endpoint(
                     job_description = jd['job_description']
                     candidate_data['job_description'] = job_description
         
-        return {
+        result = {
             "success": True,
-            "candidate_id": candidate_id,
+            "candidate_id": found_candidate_id,
             "candidate_details": candidate_data
         }
+        
+        # Thêm thông tin similarity nếu tìm bằng tên
+        if opening_similarity is not None:
+            result["opening_similarity_score"] = opening_similarity
+            result["opening_id"] = opening_id
+            result["opening_name"] = opening_name_matched
+        if candidate_similarity is not None:
+            result["candidate_similarity_score"] = candidate_similarity
+        
+        return result
     except HTTPException:
         raise
     except Exception as e:
