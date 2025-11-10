@@ -10,4 +10,4 @@ pydantic
 openpyxl
 scikit-learn
 python-dotenv
-selenium
+python-docx
