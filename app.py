@@ -615,9 +615,6 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
             # Lấy dữ liệu bài test từ Google Sheet
             test_results = get_test_results_from_google_sheet(candidate.get('id'))
             
-            # Lấy offer letter nếu có
-            offer_letter = get_offer_letter(candidate.get('id'), api_key)
-            
             candidate_info = {
                 "id": candidate.get('id'),
                 "name": candidate.get('name'),
@@ -632,8 +629,7 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
                 "opening_id": opening_id,
                 "stage_id": candidate.get('stage_id'),
                 "stage_name": candidate.get('stage_name'),
-                "test_results": test_results,
-                "offer_letter": offer_letter
+                "test_results": test_results
             }
             
             candidates.append(candidate_info)
@@ -824,10 +820,6 @@ def get_candidate_details(candidate_id, api_key):
     reviews = process_evaluations(candidate_data.get('evaluations', []))
     refined_data['reviews'] = reviews
     
-    # Lấy offer letter nếu có
-    offer_letter = get_offer_letter(candidate_id, api_key)
-    refined_data['offer_letter'] = offer_letter
-    
     return refined_data
 
 # =================================================================
@@ -872,7 +864,6 @@ class CandidateResponse(BaseModel):
     stage_id: Optional[str]
     stage_name: Optional[str]
     test_results: Optional[list[TestResult]]
-    offer_letter: Optional[OfferLetter]
 
 # =================================================================
 # API Endpoints
@@ -888,7 +879,8 @@ async def root():
             "get_candidates": "/api/opening/{opening_name_or_id}/candidates",
             "get_job_description": "/api/opening/{opening_name_or_id}/job-description",
             "get_interviews": "/api/interviews",
-            "get_candidate_details": "/api/candidate/{candidate_id}"
+            "get_candidate_details": "/api/candidate/{candidate_id}",
+            "get_offer_letter": "/api/candidate/{candidate_id}/offer-letter"
         },
         "note": "Có thể sử dụng opening_name hoặc opening_id. Hệ thống sẽ tự động tìm opening gần nhất bằng cosine similarity nếu dùng name."
     }
@@ -1105,6 +1097,39 @@ async def get_candidate_details_endpoint(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi khi lấy chi tiết ứng viên: {str(e)}")
+
+@app.get("/api/candidate/{candidate_id}/offer-letter", operation_id="layOfferLetterTheoUngVien")
+async def get_offer_letter_by_candidate(
+    candidate_id: str = Path(..., description="ID của ứng viên")
+):
+    """Lấy offer letter của ứng viên theo candidate_id. Trả về tên ứng viên, vị trí ứng tuyển và nội dung offer letter."""
+    try:
+        # Lấy thông tin cơ bản của ứng viên để lấy tên và vị trí ứng tuyển
+        candidate_data = get_candidate_details(candidate_id, BASE_API_KEY)
+        
+        candidate_name = candidate_data.get('ten')
+        vi_tri_ung_tuyen = candidate_data.get('vi_tri_ung_tuyen')
+        
+        # Lấy offer letter
+        offer_letter = get_offer_letter(candidate_id, BASE_API_KEY)
+        
+        if not offer_letter:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Không tìm thấy offer letter cho ứng viên với ID '{candidate_id}'"
+            )
+        
+        return {
+            "success": True,
+            "candidate_id": candidate_id,
+            "candidate_name": candidate_name,
+            "vi_tri_ung_tuyen": vi_tri_ung_tuyen,
+            "offer_letter": offer_letter
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy offer letter: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
