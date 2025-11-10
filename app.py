@@ -13,6 +13,11 @@ from time import time
 import pdfplumber
 from io import BytesIO
 from sklearn.feature_extraction.text import TfidfVectorizer
+try:
+    from docx import Document
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 from google import genai
@@ -249,14 +254,22 @@ def process_evaluations(evaluations):
     
     return reviews
 
-def extract_text_from_pdf(url):
-    """Trích xuất text từ PDF URL bằng pdfplumber (fallback method)"""
-    if not url:
+def extract_text_from_pdf(url=None, file_bytes=None):
+    """Trích xuất text từ PDF URL hoặc file bytes bằng pdfplumber"""
+    pdf_file = None
+    if file_bytes:
+        pdf_file = file_bytes
+    elif url:
+        try:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            pdf_file = BytesIO(response.content)
+        except Exception:
+            return None
+    else:
         return None
+    
     try:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()
-        pdf_file = BytesIO(response.content)
         text = ""
         with pdfplumber.open(pdf_file) as pdf:
             for page_num, page in enumerate(pdf.pages, 1):
@@ -266,6 +279,125 @@ def extract_text_from_pdf(url):
                     text += page_text
         return text.strip() if text else None
     except Exception as e:
+        return None
+
+def extract_text_from_docx(file_bytes):
+    """Trích xuất text từ DOCX file bytes"""
+    if not DOCX_AVAILABLE:
+        return None
+    try:
+        doc = Document(file_bytes)
+        text = "\n".join([p.text for p in doc.paragraphs]).strip()
+        return text if text else None
+    except Exception as e:
+        return None
+
+def download_file_to_bytes(url):
+    """Tải file từ URL và trả về BytesIO"""
+    if not url:
+        return None
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        response = requests.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+        return BytesIO(response.content)
+    except Exception:
+        return None
+
+def is_target_file(url, name):
+    """Kiểm tra xem file có phải PDF/DOCX/DOC không"""
+    if not url or not name:
+        return False
+    url_low = url.lower().split('?')[0]
+    name_low = name.lower()
+    return url_low.endswith(('.pdf', '.docx', '.doc')) or name_low.endswith(('.pdf', '.docx', '.doc'))
+
+def find_files_in_html(html_content):
+    """Tìm các file PDF/DOCX/DOC trong HTML content"""
+    found = []
+    if not html_content:
+        return found
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        for a in soup.find_all('a', href=True):
+            href = a['href'].strip()
+            name = a.get_text().strip() or href.split('/')[-1]
+            if is_target_file(href, name):
+                found.append((href, name))
+        return found
+    except Exception:
+        return found
+
+def get_offer_letter(candidate_id, api_key):
+    """Lấy offer letter từ messages API của ứng viên"""
+    if not candidate_id or not api_key:
+        return None
+    
+    try:
+        url = "https://hiring.base.vn/publicapi/v2/candidate/messages"
+        payload = {
+            'access_token': api_key,
+            'id': candidate_id
+        }
+        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+        
+        response = requests.post(url, headers=headers, data=payload, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        
+        if not data or 'messages' not in data:
+            return None
+        
+        messages = data['messages']
+        if not messages:
+            return None
+        
+        # Duyệt từ tin nhắn mới nhất về cũ nhất
+        for msg in messages:
+            # Ưu tiên tìm trong attachments
+            priority_files = []
+            if msg.get('has_attachment', 0) > 0:
+                for att in msg.get('attachments', []):
+                    url_att = att.get('src') or att.get('url') or att.get('org')
+                    name_att = att.get('name', 'unknown')
+                    if url_att and is_target_file(url_att, name_att):
+                        priority_files.append((url_att, name_att))
+            
+            # Nếu không có trong attachments, tìm trong HTML content
+            secondary_files = []
+            if not priority_files:
+                secondary_files = find_files_in_html(msg.get('content', ''))
+            
+            all_files = priority_files + secondary_files
+            if not all_files:
+                continue
+            
+            # Thử tải và trích xuất file đầu tiên tìm được
+            for file_url, file_name in all_files:
+                file_bytes = download_file_to_bytes(file_url)
+                if not file_bytes:
+                    continue
+                
+                ext = file_name.lower().split('.')[-1] if '.' in file_name else file_url.split('.')[-1].split('?')[0].lower()
+                text = None
+                
+                if 'pdf' in ext:
+                    text = extract_text_from_pdf(file_bytes=file_bytes)
+                elif 'docx' in ext and DOCX_AVAILABLE:
+                    text = extract_text_from_docx(file_bytes)
+                elif 'doc' == ext:
+                    text = None  # File .doc cũ, không hỗ trợ
+                
+                if text:
+                    return {
+                        "url": file_url,
+                        "name": file_name,
+                        "text": text
+                    }
+        
+        return None
+    except Exception as e:
+        # Nếu có lỗi, trả về None (không làm gián đoạn flow chính)
         return None
 
 def extract_text_from_cv_url_with_genai(url):
@@ -483,6 +615,9 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
             # Lấy dữ liệu bài test từ Google Sheet
             test_results = get_test_results_from_google_sheet(candidate.get('id'))
             
+            # Lấy offer letter nếu có
+            offer_letter = get_offer_letter(candidate.get('id'), api_key)
+            
             candidate_info = {
                 "id": candidate.get('id'),
                 "name": candidate.get('name'),
@@ -497,7 +632,8 @@ def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=No
                 "opening_id": opening_id,
                 "stage_id": candidate.get('stage_id'),
                 "stage_name": candidate.get('stage_name'),
-                "test_results": test_results
+                "test_results": test_results,
+                "offer_letter": offer_letter
             }
             
             candidates.append(candidate_info)
@@ -688,6 +824,10 @@ def get_candidate_details(candidate_id, api_key):
     reviews = process_evaluations(candidate_data.get('evaluations', []))
     refined_data['reviews'] = reviews
     
+    # Lấy offer letter nếu có
+    offer_letter = get_offer_letter(candidate_id, api_key)
+    refined_data['offer_letter'] = offer_letter
+    
     return refined_data
 
 # =================================================================
@@ -712,6 +852,11 @@ class Review(BaseModel):
     title: str
     content: str
 
+class OfferLetter(BaseModel):
+    url: Optional[str]
+    name: Optional[str]
+    text: Optional[str]
+
 class CandidateResponse(BaseModel):
     id: str
     name: str
@@ -727,6 +872,7 @@ class CandidateResponse(BaseModel):
     stage_id: Optional[str]
     stage_name: Optional[str]
     test_results: Optional[list[TestResult]]
+    offer_letter: Optional[OfferLetter]
 
 # =================================================================
 # API Endpoints
