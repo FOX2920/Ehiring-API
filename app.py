@@ -517,6 +517,59 @@ def find_opening_id_by_name(query_name, api_key, similarity_threshold=0.5):
         # Nếu có lỗi trong vectorization, trả về None
         return None, None, 0.0
 
+def find_candidate_by_name_and_opening(candidate_name, opening_name_or_id, api_key, similarity_threshold=0.5):
+    """Tìm candidate_id dựa trên tên ứng viên và tên/ID vị trí tuyển dụng bằng cosine similarity"""
+    # Tìm opening_id từ opening_name_or_id
+    opening_id, matched_opening_name, opening_similarity = find_opening_id_by_name(
+        opening_name_or_id, 
+        api_key, 
+        similarity_threshold=similarity_threshold
+    )
+    
+    if not opening_id:
+        return None, None, None, None, opening_similarity
+    
+    # Lấy danh sách candidates của opening đó
+    candidates = get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=None, stage_name=None)
+    
+    if not candidates:
+        return None, opening_id, matched_opening_name, opening_similarity, 0.0
+    
+    # Tìm candidate bằng tên với cosine similarity
+    candidate_names = [c.get('name', '') for c in candidates if c.get('name')]
+    
+    if not candidate_names:
+        return None, opening_id, matched_opening_name, opening_similarity, 0.0
+    
+    # Kiểm tra exact match trước
+    exact_match = next((c for c in candidates if c.get('name') == candidate_name), None)
+    if exact_match:
+        return exact_match.get('id'), opening_id, matched_opening_name, opening_similarity, 1.0
+    
+    # Dùng cosine similarity để tìm candidate name gần nhất
+    try:
+        vectorizer = TfidfVectorizer()
+        name_vectors = vectorizer.fit_transform(candidate_names)
+        query_vector = vectorizer.transform([candidate_name])
+        
+        similarities = cosine_similarity(query_vector, name_vectors).flatten()
+        best_idx = np.argmax(similarities)
+        best_similarity = similarities[best_idx]
+        
+        # Nếu similarity >= threshold, trả về candidate đó
+        if best_similarity >= similarity_threshold:
+            # Tìm candidate tương ứng với index trong danh sách đã filter
+            candidates_with_names = [c for c in candidates if c.get('name')]
+            if best_idx < len(candidates_with_names):
+                best_candidate = candidates_with_names[best_idx]
+                return best_candidate.get('id'), opening_id, matched_opening_name, opening_similarity, float(best_similarity)
+            else:
+                return None, opening_id, matched_opening_name, opening_similarity, float(best_similarity)
+        else:
+            return None, opening_id, matched_opening_name, opening_similarity, float(best_similarity)
+    except Exception:
+        return None, opening_id, matched_opening_name, opening_similarity, 0.0
+
 def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=None, stage_name=None):
     """Truy xuất ứng viên cho một vị trí tuyển dụng cụ thể trong khoảng thời gian (luôn có cv_text)"""
     url = "https://hiring.base.vn/publicapi/v2/candidate/list"
@@ -880,7 +933,7 @@ async def root():
             "get_job_description": "/api/opening/{opening_name_or_id}/job-description",
             "get_interviews": "/api/interviews",
             "get_candidate_details": "/api/candidate/{candidate_id}",
-            "get_offer_letter": "/api/candidate/{candidate_id}/offer-letter"
+            "get_offer_letter": "/api/offer-letter"
         },
         "note": "Có thể sử dụng opening_name hoặc opening_id. Hệ thống sẽ tự động tìm opening gần nhất bằng cosine similarity nếu dùng name."
     }
@@ -1098,34 +1151,74 @@ async def get_candidate_details_endpoint(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi khi lấy chi tiết ứng viên: {str(e)}")
 
-@app.get("/api/candidate/{candidate_id}/offer-letter", operation_id="layOfferLetterTheoUngVien")
+@app.get("/api/offer-letter", operation_id="layOfferLetterTheoUngVien")
 async def get_offer_letter_by_candidate(
-    candidate_id: str = Path(..., description="ID của ứng viên")
+    candidate_id: Optional[str] = Query(None, description="ID của ứng viên. Bắt buộc nếu không có candidate_name và opening_name."),
+    candidate_name: Optional[str] = Query(None, description="Tên ứng viên để tìm kiếm bằng cosine similarity. Bắt buộc nếu không có candidate_id."),
+    opening_name: Optional[str] = Query(None, description="Tên hoặc ID vị trí tuyển dụng để tìm kiếm bằng cosine similarity. Bắt buộc nếu không có candidate_id.")
 ):
-    """Lấy offer letter của ứng viên theo candidate_id. Trả về tên ứng viên, vị trí ứng tuyển và nội dung offer letter."""
+    """Lấy offer letter của ứng viên. Có thể tìm bằng candidate_id, hoặc bằng candidate_name + opening_name (dùng cosine similarity). Trả về tên ứng viên, vị trí ứng tuyển và nội dung offer letter."""
     try:
-        # Lấy thông tin cơ bản của ứng viên để lấy tên và vị trí ứng tuyển
-        candidate_data = get_candidate_details(candidate_id, BASE_API_KEY)
+        found_candidate_id = candidate_id
+        opening_id = None
+        opening_name_matched = None
+        opening_similarity = None
+        candidate_similarity = None
         
-        candidate_name = candidate_data.get('ten')
+        # Nếu không có candidate_id, phải có cả candidate_name và opening_name
+        if not found_candidate_id:
+            if not candidate_name or not opening_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Phải cung cấp candidate_id, hoặc cả candidate_name và opening_name"
+                )
+            
+            # Tìm candidate bằng tên và vị trí
+            found_candidate_id, opening_id, opening_name_matched, opening_similarity, candidate_similarity = find_candidate_by_name_and_opening(
+                candidate_name,
+                opening_name,
+                BASE_API_KEY,
+                similarity_threshold=0.5
+            )
+            
+            if not found_candidate_id:
+                error_msg = f"Không tìm thấy ứng viên phù hợp. "
+                if opening_similarity is not None:
+                    error_msg += f"Opening similarity: {opening_similarity:.2f}. "
+                if candidate_similarity is not None:
+                    error_msg += f"Candidate similarity: {candidate_similarity:.2f}."
+                raise HTTPException(status_code=404, detail=error_msg)
+        
+        # Lấy thông tin cơ bản của ứng viên để lấy tên và vị trí ứng tuyển
+        candidate_data = get_candidate_details(found_candidate_id, BASE_API_KEY)
+        
+        candidate_name_result = candidate_data.get('ten')
         vi_tri_ung_tuyen = candidate_data.get('vi_tri_ung_tuyen')
         
         # Lấy offer letter
-        offer_letter = get_offer_letter(candidate_id, BASE_API_KEY)
+        offer_letter = get_offer_letter(found_candidate_id, BASE_API_KEY)
         
         if not offer_letter:
             raise HTTPException(
                 status_code=404,
-                detail=f"Không tìm thấy offer letter cho ứng viên với ID '{candidate_id}'"
+                detail=f"Không tìm thấy offer letter cho ứng viên với ID '{found_candidate_id}'"
             )
         
-        return {
+        result = {
             "success": True,
-            "candidate_id": candidate_id,
-            "candidate_name": candidate_name,
+            "candidate_id": found_candidate_id,
+            "candidate_name": candidate_name_result,
             "vi_tri_ung_tuyen": vi_tri_ung_tuyen,
             "offer_letter": offer_letter
         }
+        
+        # Thêm thông tin similarity nếu tìm bằng tên
+        if opening_similarity is not None:
+            result["opening_similarity_score"] = opening_similarity
+        if candidate_similarity is not None:
+            result["candidate_similarity_score"] = candidate_similarity
+        
+        return result
     except HTTPException:
         raise
     except Exception as e:
