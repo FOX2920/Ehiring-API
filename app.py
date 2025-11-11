@@ -969,19 +969,19 @@ async def root():
 async def get_job_description_by_opening(
     opening_name_or_id: Optional[str] = Query(None, description="Tên hoặc ID của vị trí tuyển dụng. Bỏ trống để lấy tất cả các opening có status 10.")
 ):
-    """Lấy JD (Job Description) theo opening_name hoặc opening_id. Nếu không có tham số hoặc không tìm thấy, trả về tất cả các opening có status 10 với dữ liệu chi tiết."""
+    """Lấy JD (Job Description) theo opening_name hoặc opening_id. Nếu không có tham số hoặc không tìm thấy, trả về tất cả các opening có status 10 (chỉ id và name)."""
     try:
-        # Lấy JD (Job Description)
-        jds = get_job_descriptions(BASE_API_KEY, use_cache=True)
+        # Lấy danh sách openings có status 10 (chỉ id và name)
+        openings = get_base_openings(BASE_API_KEY, use_cache=True)
         
-        # Nếu không có opening_name_or_id, trả về tất cả các JD có status 10
+        # Nếu không có opening_name_or_id, trả về tất cả các opening có status 10 (chỉ id và name)
         if not opening_name_or_id:
             return {
                 "success": True,
                 "query": None,
                 "message": "Trả về tất cả các opening có status 10.",
-                "total_openings": len(jds),
-                "job_descriptions": jds
+                "total_openings": len(openings),
+                "openings": openings
             }
         
         # Tìm opening_id từ name hoặc id bằng cosine similarity
@@ -990,18 +990,19 @@ async def get_job_description_by_opening(
             BASE_API_KEY
         )
         
-        # Nếu không tìm thấy opening cụ thể, trả về tất cả các JD có status 10
+        # Nếu không tìm thấy opening cụ thể, trả về tất cả các opening có status 10 (chỉ id và name)
         if not opening_id:
             return {
                 "success": True,
                 "query": opening_name_or_id,
                 "message": f"Không tìm thấy vị trí phù hợp với '{opening_name_or_id}'. Trả về tất cả các opening có status 10.",
                 "similarity_score": similarity_score,
-                "total_openings": len(jds),
-                "job_descriptions": jds
+                "total_openings": len(openings),
+                "openings": openings
             }
         
-        # Tìm JD cụ thể theo opening_id
+        # Lấy JD (Job Description) để tìm JD cụ thể
+        jds = get_job_descriptions(BASE_API_KEY, use_cache=True)
         jd = next((jd for jd in jds if jd['id'] == opening_id), None)
         
         if not jd:
@@ -1009,7 +1010,7 @@ async def get_job_description_by_opening(
             jds = get_job_descriptions(BASE_API_KEY, use_cache=False)
             jd = next((jd for jd in jds if jd['id'] == opening_id), None)
         
-        # Nếu vẫn không tìm thấy JD cụ thể, trả về tất cả các JD có status 10
+        # Nếu vẫn không tìm thấy JD cụ thể, trả về tất cả các opening có status 10 (chỉ id và name)
         if not jd:
             return {
                 "success": True,
@@ -1018,8 +1019,8 @@ async def get_job_description_by_opening(
                 "opening_name": matched_name,
                 "similarity_score": similarity_score,
                 "message": f"Không tìm thấy JD cho vị trí '{opening_name_or_id}'. Trả về tất cả các opening có status 10.",
-                "total_openings": len(jds),
-                "job_descriptions": jds
+                "total_openings": len(openings),
+                "openings": openings
             }
         
         return {
