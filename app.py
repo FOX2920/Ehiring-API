@@ -525,7 +525,9 @@ def find_candidate_by_name_in_opening(candidate_name, opening_id, api_key, simil
         opening_id: ID của opening
         api_key: API key để gọi Base API
         similarity_threshold: Ngưỡng similarity tối thiểu (mặc định 0.5)
-        filter_stages: Danh sách stage names để lọc (None = không lọc, chỉ dùng cho offer letter)
+        filter_stages: Danh sách stage names để lọc. 
+                      - None = không lọc stage, tìm trong tất cả stage (dùng cho /api/candidate)
+                      - ['Offered', 'Hired'] = chỉ tìm trong stage "Offered" và "Hired" (chỉ dùng cho /api/offer-letter)
     """
     if not candidate_name or not opening_id:
         return None, 0.0
@@ -548,7 +550,8 @@ def find_candidate_by_name_in_opening(candidate_name, opening_id, api_key, simil
     if 'candidates' not in data or not data['candidates']:
         return None, 0.0
     
-    # Lọc theo stage nếu có filter_stages (chỉ dùng cho offer letter)
+    # Lọc theo stage nếu có filter_stages (chỉ dùng cho endpoint /api/offer-letter)
+    # Endpoint /api/candidate luôn truyền filter_stages=None để tìm trong tất cả stage
     if filter_stages:
         filtered_candidates = []
         for candidate in data['candidates']:
