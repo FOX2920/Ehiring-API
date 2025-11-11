@@ -969,7 +969,7 @@ async def root():
 async def get_job_description_by_opening(
     opening_name_or_id: str = Path(..., description="Tên hoặc ID của vị trí tuyển dụng")
 ):
-    """Lấy JD (Job Description) theo opening_name hoặc opening_id"""
+    """Lấy JD (Job Description) theo opening_name hoặc opening_id. Nếu không tìm thấy, trả về tất cả các opening có status 10 với dữ liệu chi tiết."""
     try:
         # Tìm opening_id từ name hoặc id bằng cosine similarity
         opening_id, matched_name, similarity_score = find_opening_id_by_name(
@@ -977,14 +977,21 @@ async def get_job_description_by_opening(
             BASE_API_KEY
         )
         
-        if not opening_id:
-            raise HTTPException(
-                status_code=404, 
-                detail=f"Không tìm thấy vị trí phù hợp với '{opening_name_or_id}'. Similarity score cao nhất: {similarity_score:.2f}"
-            )
-        
         # Lấy JD (Job Description)
         jds = get_job_descriptions(BASE_API_KEY, use_cache=True)
+        
+        # Nếu không tìm thấy opening cụ thể, trả về tất cả các JD có status 10
+        if not opening_id:
+            return {
+                "success": True,
+                "query": opening_name_or_id,
+                "message": f"Không tìm thấy vị trí phù hợp với '{opening_name_or_id}'. Trả về tất cả các opening có status 10.",
+                "similarity_score": similarity_score,
+                "total_openings": len(jds),
+                "job_descriptions": jds
+            }
+        
+        # Tìm JD cụ thể theo opening_id
         jd = next((jd for jd in jds if jd['id'] == opening_id), None)
         
         if not jd:
@@ -992,11 +999,18 @@ async def get_job_description_by_opening(
             jds = get_job_descriptions(BASE_API_KEY, use_cache=False)
             jd = next((jd for jd in jds if jd['id'] == opening_id), None)
         
+        # Nếu vẫn không tìm thấy JD cụ thể, trả về tất cả các JD có status 10
         if not jd:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Không tìm thấy JD cho vị trí '{opening_name_or_id}'"
-            )
+            return {
+                "success": True,
+                "query": opening_name_or_id,
+                "opening_id": opening_id,
+                "opening_name": matched_name,
+                "similarity_score": similarity_score,
+                "message": f"Không tìm thấy JD cho vị trí '{opening_name_or_id}'. Trả về tất cả các opening có status 10.",
+                "total_openings": len(jds),
+                "job_descriptions": jds
+            }
         
         return {
             "success": True,
