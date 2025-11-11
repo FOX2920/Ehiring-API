@@ -517,12 +517,20 @@ def find_opening_id_by_name(query_name, api_key, similarity_threshold=0.5):
         # Nếu có lỗi trong vectorization, trả về None
         return None, None, 0.0
 
-def find_candidate_by_name_in_opening(candidate_name, opening_id, api_key, similarity_threshold=0.5):
-    """Tìm candidate_id dựa trên tên ứng viên trong một opening cụ thể bằng cosine similarity. Chỉ tìm trong các stage 'Offered' và 'Hired' để tối ưu tốc độ."""
+def find_candidate_by_name_in_opening(candidate_name, opening_id, api_key, similarity_threshold=0.5, filter_stages=None):
+    """Tìm candidate_id dựa trên tên ứng viên trong một opening cụ thể bằng cosine similarity.
+    
+    Args:
+        candidate_name: Tên ứng viên cần tìm
+        opening_id: ID của opening
+        api_key: API key để gọi Base API
+        similarity_threshold: Ngưỡng similarity tối thiểu (mặc định 0.5)
+        filter_stages: Danh sách stage names để lọc (None = không lọc, chỉ dùng cho offer letter)
+    """
     if not candidate_name or not opening_id:
         return None, 0.0
     
-    # Lấy danh sách candidates của opening đó (chưa lọc stage)
+    # Lấy danh sách candidates của opening đó
     url = "https://hiring.base.vn/publicapi/v2/candidate/list"
     payload = {
         'access_token': api_key,
@@ -540,16 +548,19 @@ def find_candidate_by_name_in_opening(candidate_name, opening_id, api_key, simil
     if 'candidates' not in data or not data['candidates']:
         return None, 0.0
     
-    # Lọc chỉ lấy candidates ở stage "Offered" hoặc "Hired" (case-insensitive)
-    target_stages = ['Offered', 'Hired']
-    filtered_candidates = []
-    for candidate in data['candidates']:
-        stage_name = candidate.get('stage_name', '')
-        if stage_name and stage_name in target_stages:
-            filtered_candidates.append(candidate)
-    
-    if not filtered_candidates:
-        return None, 0.0
+    # Lọc theo stage nếu có filter_stages (chỉ dùng cho offer letter)
+    if filter_stages:
+        filtered_candidates = []
+        for candidate in data['candidates']:
+            stage_name = candidate.get('stage_name', '')
+            if stage_name and stage_name in filter_stages:
+                filtered_candidates.append(candidate)
+        
+        if not filtered_candidates:
+            return None, 0.0
+    else:
+        # Không lọc stage, lấy tất cả candidates
+        filtered_candidates = data['candidates']
     
     # Tìm candidate bằng tên với cosine similarity trong danh sách đã lọc
     candidate_names = [c.get('name', '') for c in filtered_candidates if c.get('name')]
@@ -1141,12 +1152,13 @@ async def get_candidate_details_endpoint(
                     detail=f"Không tìm thấy vị trí phù hợp với '{opening_name_or_id}'. Similarity score cao nhất: {opening_similarity:.2f}"
                 )
             
-            # Tìm candidate trong opening đó bằng tên với cosine similarity
+            # Tìm candidate trong opening đó bằng tên với cosine similarity (không filter stage)
             found_candidate_id, candidate_similarity = find_candidate_by_name_in_opening(
                 candidate_name,
                 opening_id,
                 BASE_API_KEY,
-                similarity_threshold=0.5
+                similarity_threshold=0.5,
+                filter_stages=None  # Không lọc stage cho endpoint candidate
             )
             
             if not found_candidate_id:
@@ -1250,12 +1262,13 @@ async def get_offer_letter_by_candidate(
                     detail=f"Không tìm thấy vị trí phù hợp với '{opening_name_or_id}'. Similarity score cao nhất: {opening_similarity:.2f}"
                 )
             
-            # Tìm candidate trong opening đó bằng tên với cosine similarity
+            # Tìm candidate trong opening đó bằng tên với cosine similarity (chỉ tìm trong stage "Offered" và "Hired")
             found_candidate_id, candidate_similarity = find_candidate_by_name_in_opening(
                 candidate_name,
                 opening_id,
                 BASE_API_KEY,
-                similarity_threshold=0.5
+                similarity_threshold=0.5,
+                filter_stages=['Offered', 'Hired']  # Chỉ lọc stage cho offer letter
             )
             
             if not found_candidate_id:
