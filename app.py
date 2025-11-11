@@ -1181,7 +1181,7 @@ async def get_candidate_details_endpoint(
             candidate_data['cv_text'] = cv_text
         
         # Lấy dữ liệu bài test từ Google Sheet
-        test_results = get_test_results_from_google_sheet(candidate_id)
+        test_results = get_test_results_from_google_sheet(found_candidate_id)
         candidate_data['test_results'] = test_results
         
         # Lấy JD dựa trên opening name
