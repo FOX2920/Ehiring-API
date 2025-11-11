@@ -1,260 +1,623 @@
-# Base Hiring API - JD và CV Extractor
+# Base Hiring API - Job Description & CV Extractor
 
-FastAPI Backend để trích xuất dữ liệu JD (Job Description) và CV từ Base Hiring API.
+API để trích xuất và quản lý dữ liệu tuyển dụng từ Base Hiring platform, bao gồm Job Descriptions (JD), thông tin ứng viên, lịch phỏng vấn và offer letters.
 
-## Tính năng
+## 📋 Mục lục
 
-- Trích xuất Job Description từ các vị trí tuyển dụng đang mở
-- Lấy danh sách ứng viên theo vị trí tuyển dụng
-- Trích xuất nội dung CV từ URL (ưu tiên pdfplumber, fallback về Gemini AI)
-- Lấy lịch phỏng vấn theo vị trí và ngày
-- Lấy chi tiết ứng viên với đầy đủ thông tin
-- Tự động tìm kiếm vị trí tuyển dụng bằng cosine similarity
-- Cache dữ liệu để tối ưu hiệu suất
+- [Tính năng chính](#-tính-năng-chính)
+- [Cài đặt](#-cài-đặt)
+- [Cấu hình](#-cấu-hình)
+- [API Endpoints](#-api-endpoints)
+- [Sơ đồ hoạt động](#-sơ-đồ-hoạt-động)
+- [Ví dụ sử dụng](#-ví-dụ-sử-dụng)
 
-## Yêu cầu
+## 🚀 Tính năng chính
+
+- ✅ Trích xuất Job Description từ các vị trí tuyển dụng
+- ✅ Lấy danh sách và chi tiết ứng viên
+- ✅ Tự động trích xuất text từ CV (PDF/DOCX) bằng Gemini AI
+- ✅ Quản lý lịch phỏng vấn
+- ✅ Trích xuất Offer Letter
+- ✅ Tìm kiếm thông minh với Cosine Similarity
+- ✅ Cache dữ liệu để tối ưu hiệu suất
+- ✅ Tích hợp Google Sheet cho dữ liệu bài test
+
+## 📦 Cài đặt
+
+### Yêu cầu hệ thống
 
 - Python 3.8+
-- Các thư viện Python (xem requirements.txt hoặc phần Dependencies)
+- pip
 
-## Cài đặt
+### Cài đặt dependencies
 
-1. Clone repository hoặc tải file `base_hiring_api.py`
-
-2. Cài đặt các dependencies:
 ```bash
-pip install fastapi uvicorn requests beautifulsoup4 pdfplumber scikit-learn numpy google-genai pytz python-dotenv
+pip install fastapi uvicorn requests beautifulsoup4 pdfplumber scikit-learn numpy python-dotenv google-generativeai pytz python-docx
 ```
 
-3. Tạo file `.env` trong thư mục gốc với nội dung:
-```
-BASE_API_KEY=your_base_api_key_here
-GEMINI_API_KEY=your_gemini_api_key_here
-GEMINI_API_KEY_DU_PHONG=backup_key1,backup_key2
-```
-
-## Cấu hình
-
-### Biến môi trường
-
-- `BASE_API_KEY` (bắt buộc): API key để truy cập Base Hiring API
-- `GEMINI_API_KEY` (bắt buộc): API key chính cho Google Gemini AI
-- `GEMINI_API_KEY_DU_PHONG` (tùy chọn): Danh sách API keys dự phòng, phân cách bằng dấu phẩy
-
-## Chạy ứng dụng
+### Chạy server
 
 ```bash
 python base_hiring_api.py
 ```
 
-Hoặc sử dụng uvicorn trực tiếp:
-```bash
-uvicorn base_hiring_api:app --reload --host 0.0.0.0 --port 8000
+Server sẽ chạy tại: `http://localhost:8000`
+
+## ⚙️ Cấu hình
+
+Tạo file `.env` trong thư mục gốc:
+
+```env
+# Bắt buộc
+BASE_API_KEY=your_base_api_key_here
+GEMINI_API_KEY=your_gemini_api_key_here
+
+# Tùy chọn
+GEMINI_API_KEY_DU_PHONG=key1,key2,key3  # API keys dự phòng (phân cách bằng dấu phẩy)
+GOOGLE_SHEET_SCRIPT_URL=your_google_sheet_script_url
+ACCOUNT_API_KEY=your_account_api_key
 ```
 
-API sẽ chạy tại: `http://localhost:8000`
+### Giải thích các biến môi trường
 
-## API Endpoints
+| Biến | Mô tả | Bắt buộc |
+|------|-------|----------|
+| `BASE_API_KEY` | API key của Base Hiring | ✅ |
+| `GEMINI_API_KEY` | API key của Google Gemini (trích xuất CV) | ✅ |
+| `GEMINI_API_KEY_DU_PHONG` | API keys dự phòng khi chính bị rate limit | ❌ |
+| `GOOGLE_SHEET_SCRIPT_URL` | URL script để lấy dữ liệu bài test | ❌ |
+| `ACCOUNT_API_KEY` | API key để lấy thông tin users cho reviews | ❌ |
+
+## 🔌 API Endpoints
 
 ### 1. Health Check
-
-**GET** `/`
-
-Kiểm tra trạng thái API và xem danh sách các endpoints có sẵn.
-
-**Response:**
-```json
-{
-  "status": "ok",
-  "message": "Base Hiring API - Trích xuất JD và CV",
-  "endpoints": {
-    "get_candidates": "/api/opening/{opening_name_or_id}/candidates",
-    "get_job_description": "/api/opening/{opening_name_or_id}/job-description",
-    "get_interviews": "/api/interviews",
-    "get_candidate_details": "/api/candidate/{candidate_id}"
-  }
-}
+```http
+GET /
 ```
+
+Kiểm tra trạng thái API và xem danh sách endpoints.
+
+---
 
 ### 2. Lấy Job Description
 
-**GET** `/api/opening/{opening_name_or_id}/job-description`
+```http
+GET /api/opening/job-description?opening_name_or_id={name_or_id}
+```
 
-Lấy JD (Job Description) theo tên hoặc ID của vị trí tuyển dụng. Hệ thống tự động tìm kiếm vị trí gần nhất bằng cosine similarity nếu dùng tên.
-
-**Parameters:**
-- `opening_name_or_id` (path): Tên hoặc ID của vị trí tuyển dụng
+**Tham số:**
+- `opening_name_or_id` (optional): Tên hoặc ID của vị trí tuyển dụng
+  - Nếu bỏ trống: Trả về tất cả openings có status 10
+  - Nếu có giá trị: Tìm kiếm bằng Cosine Similarity
 
 **Response:**
 ```json
 {
   "success": true,
-  "query": "opening_name_or_id",
+  "query": "Backend Developer",
   "opening_id": "123",
-  "opening_name": "Tên vị trí chính xác",
+  "opening_name": "Backend Developer",
   "similarity_score": 0.95,
-  "job_description": "Nội dung JD..."
+  "job_description": "Chi tiết JD..."
 }
 ```
+
+---
 
 ### 3. Lấy danh sách ứng viên
 
-**GET** `/api/opening/{opening_name_or_id}/candidates`
+```http
+GET /api/opening/{opening_name_or_id}/candidates?start_date=2024-01-01&end_date=2024-12-31&stage_name=Interviewed
+```
 
-Lấy tất cả ứng viên theo vị trí tuyển dụng, bao gồm cv_text đã được trích xuất.
-
-**Parameters:**
-- `opening_name_or_id` (path): Tên hoặc ID của vị trí tuyển dụng
-- `start_date` (query, tùy chọn): Ngày bắt đầu lọc (YYYY-MM-DD)
-- `end_date` (query, tùy chọn): Ngày kết thúc lọc (YYYY-MM-DD)
-- `stage_name` (query, tùy chọn): Lọc theo stage name
+**Tham số:**
+- `opening_name_or_id` (required): Tên hoặc ID vị trí tuyển dụng
+- `start_date` (optional): Ngày bắt đầu lọc (YYYY-MM-DD)
+- `end_date` (optional): Ngày kết thúc lọc (YYYY-MM-DD)
+- `stage_name` (optional): Lọc theo stage (VD: "Interviewed", "Offered")
 
 **Response:**
 ```json
 {
   "success": true,
-  "query": "opening_name_or_id",
   "opening_id": "123",
-  "opening_name": "Tên vị trí",
-  "similarity_score": 0.95,
-  "job_description": "Nội dung JD...",
+  "opening_name": "Backend Developer",
+  "job_description": "...",
   "total_candidates": 10,
   "candidates": [
     {
-      "id": "candidate_id",
-      "name": "Tên ứng viên",
+      "id": "candidate_123",
+      "name": "Nguyễn Văn A",
       "email": "email@example.com",
-      "phone": "0123456789",
-      "gender": "M",
-      "cv_url": "https://...",
-      "cv_text": "Nội dung CV đã trích xuất...",
-      "review": "Đánh giá...",
-      "form_data": {},
-      "opening_id": "123",
-      "stage_id": "456",
-      "stage_name": "Đã phỏng vấn"
+      "cv_text": "Extracted CV content...",
+      "reviews": [
+        {
+          "name": "Hoang Tran",
+          "title": "CEO",
+          "content": "Excellent candidate..."
+        }
+      ],
+      "test_results": [...]
     }
   ]
 }
 ```
+
+---
 
 ### 4. Lấy lịch phỏng vấn
 
-**GET** `/api/interviews`
+```http
+GET /api/interviews?opening_name_or_id=Backend&date=2024-11-15
+```
 
-Lấy lịch phỏng vấn, có thể lọc theo vị trí tuyển dụng và ngày.
-
-**Parameters:**
-- `opening_name_or_id` (query, tùy chọn): Tên hoặc ID của vị trí tuyển dụng
-- `date` (query, tùy chọn): Lấy lịch cho 1 ngày cụ thể (YYYY-MM-DD)
-- `start_date` (query, tùy chọn): Ngày bắt đầu lọc (YYYY-MM-DD)
-- `end_date` (query, tùy chọn): Ngày kết thúc lọc (YYYY-MM-DD)
+**Tham số:**
+- `opening_name_or_id` (optional): Lọc theo vị trí tuyển dụng
+- `date` (optional): Lọc theo ngày cụ thể (YYYY-MM-DD)
+- `start_date` (optional): Ngày bắt đầu
+- `end_date` (optional): Ngày kết thúc
 
 **Response:**
 ```json
 {
   "success": true,
-  "query": "opening_name_or_id",
-  "date": "2024-01-15",
-  "opening_id": "123",
-  "opening_name": "Tên vị trí",
-  "similarity_score": 0.95,
   "total_interviews": 5,
   "interviews": [
     {
-      "id": "interview_id",
-      "candidate_id": "candidate_id",
-      "candidate_name": "Tên ứng viên",
-      "opening_name": "Tên vị trí",
-      "time_dt": "2024-01-15T10:00:00+07:00"
+      "id": "interview_123",
+      "candidate_name": "Nguyễn Văn A",
+      "opening_name": "Backend Developer",
+      "time_dt": "2024-11-15T14:00:00+07:00"
     }
   ]
 }
 ```
 
+---
+
 ### 5. Lấy chi tiết ứng viên
 
-**GET** `/api/candidate/{candidate_id}`
+```http
+GET /api/candidate?candidate_id=123
+```
 
-Lấy chi tiết đầy đủ của một ứng viên, bao gồm cv_text và job_description.
+hoặc
 
-**Parameters:**
-- `candidate_id` (path): ID của ứng viên
+```http
+GET /api/candidate?opening_name_or_id=Backend&candidate_name=Nguyen Van A
+```
+
+**Tham số (chọn 1 trong 2 cách):**
+
+**Cách 1:** Tìm trực tiếp bằng ID
+- `candidate_id`: ID của ứng viên
+
+**Cách 2:** Tìm bằng tên (sử dụng Cosine Similarity)
+- `opening_name_or_id`: Tên/ID vị trí tuyển dụng
+- `candidate_name`: Tên ứng viên
 
 **Response:**
 ```json
 {
   "success": true,
-  "candidate_id": "candidate_id",
+  "candidate_id": "123",
   "candidate_details": {
-    "id": "candidate_id",
-    "ten": "Tên ứng viên",
+    "id": "123",
+    "ten": "Nguyễn Văn A",
     "email": "email@example.com",
-    "so_dien_thoai": "0123456789",
-    "vi_tri_ung_tuyen": "Tên vị trí",
-    "opening_id": "123",
-    "stage_id": "456",
-    "stage_name": "Đã phỏng vấn",
-    "cv_url": "https://...",
-    "cv_text": "Nội dung CV đã trích xuất...",
-    "job_description": "Nội dung JD..."
+    "vi_tri_ung_tuyen": "Backend Developer",
+    "cv_text": "Extracted CV...",
+    "job_description": "JD content...",
+    "reviews": [...],
+    "test_results": [...]
   }
 }
 ```
 
-## Trích xuất CV
+---
 
-Hệ thống sử dụng phương pháp hai bước để trích xuất nội dung CV:
+### 6. Lấy Offer Letter
 
-1. **Ưu tiên pdfplumber**: Trích xuất text trực tiếp từ PDF URL
-2. **Fallback Gemini AI**: Nếu pdfplumber không thành công, sử dụng Google Gemini AI để đọc và trích xuất text từ URL
+```http
+GET /api/offer-letter?candidate_id=123
+```
 
-Điều này giúp:
-- Giảm số lượng request đến Gemini API
-- Tăng tốc độ xử lý cho các file PDF hợp lệ
-- Vẫn có phương án dự phòng cho các trường hợp đặc biệt
+hoặc
 
-## Cache
+```http
+GET /api/offer-letter?opening_name_or_id=Backend&candidate_name=Nguyen Van A
+```
 
-Hệ thống sử dụng cache trong bộ nhớ với TTL 5 phút cho:
-- Danh sách vị trí tuyển dụng (openings)
-- Danh sách Job Descriptions
+**Tham số:** Giống như endpoint `/api/candidate`
 
-Cache giúp giảm số lượng request đến Base API và cải thiện hiệu suất.
+**Lưu ý:** Endpoint này chỉ tìm kiếm trong các ứng viên có stage là "Offered" hoặc "Hired"
 
-## Cosine Similarity
+**Response:**
+```json
+{
+  "success": true,
+  "candidate_name": "Nguyễn Văn A",
+  "vi_tri_ung_tuyen": "Backend Developer",
+  "offer_letter": {
+    "url": "https://...",
+    "name": "offer_letter.pdf",
+    "text": "Extracted offer letter content..."
+  }
+}
+```
 
-Hệ thống sử dụng cosine similarity với TF-IDF vectorization để:
-- Tìm kiếm vị trí tuyển dụng gần nhất khi người dùng nhập tên không chính xác
-- Tìm kiếm stage name phù hợp khi lọc ứng viên
+## 📊 Sơ đồ hoạt động
 
-## Xử lý lỗi
+### 1. Luồng lấy Job Description
 
-- **400 Bad Request**: Dữ liệu đầu vào không hợp lệ
-- **404 Not Found**: Không tìm thấy tài nguyên (vị trí, ứng viên, etc.)
-- **500 Internal Server Error**: Lỗi server
-- **503 Service Unavailable**: Lỗi kết nối đến Base API hoặc Gemini API
+```
+┌─────────────┐
+│   Client    │
+└──────┬──────┘
+       │ GET /api/opening/job-description?opening_name_or_id=Backend
+       ▼
+┌─────────────────────────────────────────────────┐
+│         Kiểm tra Cache (5 phút TTL)             │
+├─────────────────────────────────────────────────┤
+│  ✓ Có cache → Trả về ngay                       │
+│  ✗ Không cache → Tiếp tục                       │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Gọi Base API: /opening/list (status=10)        │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Tìm kiếm Opening bằng Cosine Similarity        │
+├─────────────────────────────────────────────────┤
+│  • Exact match → similarity = 1.0               │
+│  • Fuzzy match → TF-IDF vectorization           │
+│  • Threshold: 0.5                               │
+└──────┬──────────────────────────────────────────┘
+       │
+       ├─ ✓ Tìm thấy
+       │  └─► Trích xuất JD từ HTML content
+       │      └─► Trả về JD + similarity score
+       │
+       └─ ✗ Không tìm thấy
+          └─► Trả về danh sách tất cả openings
+```
 
-## Dependencies
+### 2. Luồng lấy ứng viên
 
-- `fastapi`: Framework web API
-- `uvicorn`: ASGI server
-- `requests`: HTTP client
-- `beautifulsoup4`: Parse HTML
-- `pdfplumber`: Trích xuất text từ PDF
-- `scikit-learn`: Cosine similarity và TF-IDF
-- `numpy`: Xử lý mảng
-- `google-genai`: Google Gemini AI client
-- `pytz`: Xử lý timezone
-- `python-dotenv`: Đọc biến môi trường từ .env
+```
+┌─────────────┐
+│   Client    │
+└──────┬──────┘
+       │ GET /api/opening/{name}/candidates
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Tìm Opening ID (Cosine Similarity)             │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Gọi Base API: /candidate/list                  │
+│  (với opening_id, start_date, end_date)         │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Lọc theo stage_name (nếu có)                   │
+│  Sử dụng Cosine Similarity để match stage       │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼ (Song song xử lý từng ứng viên)
+┌─────────────────────────────────────────────────┐
+│  Với mỗi ứng viên:                              │
+├─────────────────────────────────────────────────┤
+│  1. Trích xuất CV text                          │
+│     ├─ PDF → pdfplumber                         │
+│     ├─ Fallback → Gemini AI (với retry)         │
+│     └─ Rate limit → Chuyển sang API dự phòng    │
+│                                                 │
+│  2. Xử lý Reviews                               │
+│     ├─ Lấy username từ evaluations              │
+│     ├─ Map sang name + title từ Account API     │
+│     └─ CEO special handling                     │
+│                                                 │
+│  3. Lấy Test Results từ Google Sheet            │
+│                                                 │
+│  4. Parse Form Data                             │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Trả về danh sách ứng viên + JD                 │
+└─────────────────────────────────────────────────┘
+```
 
-## Ghi chú
+### 3. Luồng lấy lịch phỏng vấn
 
-- Tất cả thời gian được chuyển đổi sang timezone Asia/Ho_Chi_Minh
-- Hệ thống tự động retry với các API keys dự phòng khi gặp lỗi rate limit (429)
-- CV text được trích xuất tự động cho tất cả ứng viên trong danh sách
+```
+┌─────────────┐
+│   Client    │
+└──────┬──────┘
+       │ GET /api/interviews?date=2024-11-15
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Gọi Base API: /interview/list                  │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Lọc theo Opening (nếu có opening_name_or_id)   │
+│  Sử dụng Cosine Similarity                      │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Chuyển đổi timestamp → datetime                │
+│  Timezone: Asia/Ho_Chi_Minh (UTC+7)             │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Lọc theo date (nếu có tham số date)            │
+│  So sánh date của time_dt                       │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Trả về danh sách interviews                    │
+└─────────────────────────────────────────────────┘
+```
 
-## License
+### 4. Luồng lấy chi tiết ứng viên
+
+```
+┌─────────────┐
+│   Client    │
+└──────┬──────┘
+       │ GET /api/candidate?opening_name_or_id=Backend&candidate_name=Nguyen Van A
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Kiểm tra tham số đầu vào                       │
+├─────────────────────────────────────────────────┤
+│  Cách 1: candidate_id                           │
+│  Cách 2: opening_name_or_id + candidate_name    │
+└──────┬──────────────────────────────────────────┘
+       │
+       ├─ Cách 1: candidate_id
+       │  └─► Sử dụng trực tiếp
+       │
+       └─ Cách 2: Tìm kiếm bằng tên
+          │
+          ▼
+       ┌─────────────────────────────────────────────────┐
+       │  Tìm Opening (Cosine Similarity)                │
+       └──────┬──────────────────────────────────────────┘
+              │
+              ▼
+       ┌─────────────────────────────────────────────────┐
+       │  Gọi Base API: /candidate/list (theo opening)   │
+       └──────┬──────────────────────────────────────────┘
+              │
+              ▼
+       ┌─────────────────────────────────────────────────┐
+       │  Tìm Candidate bằng tên (Cosine Similarity)     │
+       │  • Không lọc stage (tìm trong tất cả stages)    │
+       │  • Threshold: 0.5                               │
+       └──────┬──────────────────────────────────────────┘
+              │
+              ▼
+┌─────────────────────────────────────────────────┐
+│  Gọi Base API: /candidate/get                   │
+│  Lấy dữ liệu chi tiết (raw response)            │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Làm phẳng dữ liệu (flatten)                    │
+│  • fields → key-value pairs                     │
+│  • form → key-value pairs                       │
+│  • evaluations → reviews với name + title       │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Trích xuất CV text (Gemini AI)                 │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Lấy Test Results (Google Sheet)                │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Tìm và thêm Job Description                    │
+│  (dựa trên opening_name từ evaluations)         │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Trả về candidate_details (JSON phẳng)          │
+└─────────────────────────────────────────────────┘
+```
+
+### 5. Luồng lấy Offer Letter
+
+```
+┌─────────────┐
+│   Client    │
+└──────┬──────┘
+       │ GET /api/offer-letter?opening_name_or_id=Backend&candidate_name=Nguyen Van A
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Tìm Candidate ID (giống /api/candidate)        │
+│  • Tìm Opening (Cosine Similarity)              │
+│  • Tìm Candidate (Cosine Similarity)            │
+│  ⚠️  CHỈ TÌM trong stage: Offered, Hired        │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Gọi Base API: /candidate/messages              │
+│  Lấy tất cả tin nhắn của ứng viên               │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Duyệt tin nhắn từ mới → cũ                     │
+│  Tìm file PDF/DOCX/DOC                          │
+├─────────────────────────────────────────────────┤
+│  Ưu tiên:                                       │
+│  1. Attachments (has_attachment > 0)            │
+│  2. Links trong HTML content                    │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Tải file đầu tiên tìm được                     │
+└──────┬──────────────────────────────────────────┘
+       │
+       ▼
+┌─────────────────────────────────────────────────┐
+│  Trích xuất text                                │
+├─────────────────────────────────────────────────┤
+│  • PDF → pdfplumber                             │
+│  • DOCX → python-docx                           │
+│  • DOC → Không hỗ trợ                           │
+└──────┬──────────────────────────────────────────┘
+       │
+       ├─ ✓ Trích xuất thành công
+       │  └─► Trả về offer letter + candidate info
+       │
+       └─ ✗ Không tìm thấy hoặc lỗi
+          └─► HTTP 404
+```
+
+## 💡 Ví dụ sử dụng
+
+### Python
+
+```python
+import requests
+
+BASE_URL = "http://localhost:8000"
+
+# 1. Lấy Job Description
+response = requests.get(f"{BASE_URL}/api/opening/job-description", params={
+    "opening_name_or_id": "Backend Developer"
+})
+jd_data = response.json()
+print(f"JD: {jd_data['job_description']}")
+
+# 2. Lấy ứng viên
+response = requests.get(f"{BASE_URL}/api/opening/Backend Developer/candidates", params={
+    "start_date": "2024-01-01",
+    "stage_name": "Interviewed"
+})
+candidates = response.json()
+print(f"Tổng số ứng viên: {candidates['total_candidates']}")
+
+# 3. Lấy chi tiết ứng viên
+response = requests.get(f"{BASE_URL}/api/candidate", params={
+    "opening_name_or_id": "Backend Developer",
+    "candidate_name": "Nguyen Van A"
+})
+details = response.json()
+print(f"Email: {details['candidate_details']['email']}")
+
+# 4. Lấy offer letter
+response = requests.get(f"{BASE_URL}/api/offer-letter", params={
+    "candidate_id": "123"
+})
+offer = response.json()
+print(f"Offer letter: {offer['offer_letter']['text']}")
+```
+
+### cURL
+
+```bash
+# Lấy Job Description
+curl "http://localhost:8000/api/opening/job-description?opening_name_or_id=Backend"
+
+# Lấy ứng viên với lọc ngày
+curl "http://localhost:8000/api/opening/Backend%20Developer/candidates?start_date=2024-01-01&end_date=2024-12-31"
+
+# Lấy lịch phỏng vấn ngày hôm nay
+curl "http://localhost:8000/api/interviews?date=2024-11-15"
+
+# Lấy chi tiết ứng viên
+curl "http://localhost:8000/api/candidate?opening_name_or_id=Backend&candidate_name=Nguyen%20Van%20A"
+```
+
+## 🔍 Tính năng đặc biệt
+
+### 1. Cosine Similarity Search
+
+API sử dụng TF-IDF và Cosine Similarity để tìm kiếm thông minh:
+
+- **Opening name**: "Backend Dev" → tìm được "Backend Developer"
+- **Candidate name**: "Nguyen A" → tìm được "Nguyễn Văn A"
+- **Stage name**: "Interview" → tìm được "Interviewed"
+
+**Threshold mặc định**: 0.5 (có thể điều chỉnh)
+
+### 2. Cache System
+
+- **TTL**: 5 phút
+- **Cached data**:
+  - Danh sách openings
+  - Job descriptions
+  - Users info (cho reviews)
+
+### 3. Gemini AI Fallback
+
+Khi trích xuất CV:
+1. Thử `pdfplumber` trước (nhanh, miễn phí)
+2. Nếu thất bại → Gemini AI chính
+3. Nếu rate limit → Chuyển sang API dự phòng
+
+### 4. Review Processing
+
+- Tự động map username → tên thật + chức danh
+- Special handling: "Hoang Tran" → CEO
+- Format: `[Name - Title] Content`
+
+## 🐛 Xử lý lỗi
+
+| HTTP Code | Ý nghĩa |
+|-----------|---------|
+| 200 | Thành công |
+| 400 | Tham số không hợp lệ |
+| 404 | Không tìm thấy dữ liệu |
+| 500 | Lỗi server |
+| 503 | Không kết nối được Base API |
+
+## 📝 Lưu ý
+
+1. **Rate Limiting**: Gemini API có giới hạn request. Sử dụng API keys dự phòng.
+2. **Cache**: Dữ liệu được cache 5 phút. Force refresh bằng cách restart server.
+3. **Timezone**: Tất cả datetime được convert sang Asia/Ho_Chi_Minh (UTC+7).
+4. **File Support**: 
+   - ✅ PDF (pdfplumber + Gemini)
+   - ✅ DOCX (python-docx)
+   - ❌ DOC (không hỗ trợ)
+
+## 🔐 Bảo mật
+
+- ⚠️ Không commit file `.env` lên Git
+- ⚠️ API keys phải được bảo mật
+- ✅ CORS được bật cho development (nên hạn chế trong production)
+
+## 📚 Tài liệu tham khảo
+
+- [Base Hiring API Documentation](https://hiring.base.vn/publicapi)
+- [Google Gemini API](https://ai.google.dev/docs)
+- [FastAPI Documentation](https://fastapi.tiangolo.com/)
+
+## 📄 License
 
 MIT License
 
+---
