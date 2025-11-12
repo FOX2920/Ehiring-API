@@ -22,8 +22,6 @@ from pytz import timezone
 import re
 from html import unescape
 
-load_dotenv()
-
 mcp = FastMCP(
     name="base-hiring-assistant",
 )
