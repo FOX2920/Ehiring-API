@@ -38,7 +38,7 @@ if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY chưa được cấu hình trong file .env")
 
 # Parse GEMINI_API_KEY_DU_PHONG từ string (comma-separated) sang list
-GEMINI_API_KEY_DU_PHONG_STR = os.getenv('GEMINI_API_KEY_DU_PHONG', '')
+GEMINI_API_KEY_DU_PHONG_STR = os.getenv('GEMINI_API_KEY_DU_PHONG')
 GEMINI_API_KEY_DU_PHONG = [key.strip() for key in GEMINI_API_KEY_DU_PHONG_STR.split(',') if key.strip()] if GEMINI_API_KEY_DU_PHONG_STR else []
 
 # Google Sheet Script URL (optional) - để lấy dữ liệu bài test
