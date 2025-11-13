@@ -11,3 +11,4 @@ openpyxl
 scikit-learn
 python-dotenv
 python-docx
+gunicorn
