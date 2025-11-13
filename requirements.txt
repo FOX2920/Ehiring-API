@@ -8,8 +8,6 @@ google-genai
 pdfplumber
 pydantic
 openpyxl
-Flask
-flask-cors
 scikit-learn
 python-dotenv
 python-docx
