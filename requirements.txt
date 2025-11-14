@@ -1,5 +1,6 @@
 fastapi
 uvicorn
+pytz
 pandas
 requests
 beautifulsoup4
