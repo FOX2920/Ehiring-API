@@ -1488,6 +1488,13 @@ async def get_specific_test_result(
 ):
     """Lấy bài test cụ thể của ứng viên từ Google Sheet. Có thể tìm bằng candidate_id trực tiếp, hoặc bằng opening_name + candidate_name (dùng cosine similarity trong Google Sheet). Sau đó tìm bài test theo test_name bằng cosine similarity."""
     try:
+        # Kiểm tra Google Sheet Script URL có được cấu hình không
+        if not GOOGLE_SHEET_SCRIPT_URL:
+            raise HTTPException(
+                status_code=503,
+                detail="Google Sheet Script URL chưa được cấu hình"
+            )
+        
         found_candidate_id = candidate_id
         candidate_similarity_score = None
         opening_name_matched = None
@@ -1515,10 +1522,24 @@ async def get_specific_test_result(
             
             opening_name_matched = opening_name
         
+        # Đảm bảo found_candidate_id là string
+        found_candidate_id = str(found_candidate_id) if found_candidate_id else None
+        if not found_candidate_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Không thể xác định candidate_id"
+            )
+        
         # Lấy tất cả bài test của ứng viên từ Google Sheet
         all_test_results = get_test_results_from_google_sheet(found_candidate_id)
         
-        if not all_test_results:
+        if all_test_results is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Lỗi khi kết nối đến Google Sheet hoặc không tìm thấy bài test nào cho ứng viên với ID '{found_candidate_id}'"
+            )
+        
+        if not isinstance(all_test_results, list) or len(all_test_results) == 0:
             raise HTTPException(
                 status_code=404,
                 detail=f"Không tìm thấy bài test nào cho ứng viên với ID '{found_candidate_id}' trong Google Sheet"
@@ -1533,16 +1554,18 @@ async def get_specific_test_result(
                 error_msg += f"Test similarity score cao nhất: {test_similarity:.2f}"
             raise HTTPException(status_code=404, detail=error_msg)
         
-        # Lấy thông tin ứng viên từ Google Sheet để trả về
-        all_data = get_all_test_results_from_google_sheet()
+        # Lấy thông tin ứng viên từ Google Sheet để trả về (từ bài test đã tìm thấy hoặc từ all_data)
         candidate_name_result = None
         opening_name_result = opening_name_matched
         
-        if all_data:
+        # Thử lấy từ bài test đã tìm thấy trước (nếu có trong data)
+        # Nếu không có, thử lấy từ all_data
+        all_data = get_all_test_results_from_google_sheet()
+        if all_data and isinstance(all_data, list):
             for item in all_data:
                 if str(item.get('candidate_id', '')) == str(found_candidate_id):
-                    candidate_name_result = item.get('Tên ứng viên', '')
-                    opening_name_result = item.get('Công việc ứng tuyển', '') or opening_name_matched
+                    candidate_name_result = item.get('Tên ứng viên', '') or candidate_name_result
+                    opening_name_result = item.get('Công việc ứng tuyển', '') or opening_name_result or opening_name_matched
                     break
         
         result = {
