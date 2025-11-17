@@ -40,14 +40,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration - Load from .env file
+# Configuration - Load from environment variables
 BASE_API_KEY = os.getenv('BASE_API_KEY')
 if not BASE_API_KEY:
-    raise ValueError("BASE_API_KEY chưa được cấu hình trong file .env")
+    raise ValueError("BASE_API_KEY chưa được cấu hình trong biến môi trường")
 
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY chưa được cấu hình trong file .env")
+    raise ValueError("GEMINI_API_KEY chưa được cấu hình trong biến môi trường")
 
 # Parse GEMINI_API_KEY_DU_PHONG từ string (comma-separated) sang list
 GEMINI_API_KEY_DU_PHONG_STR = os.getenv('GEMINI_API_KEY_DU_PHONG', '')
@@ -784,8 +784,36 @@ def get_interviews(api_key, start_date=None, end_date=None, opening_id=None, fil
     
     return []
 
+def get_all_test_results_from_google_sheet():
+    """Lấy tất cả dữ liệu bài test từ Google Sheet"""
+    if not GOOGLE_SHEET_SCRIPT_URL:
+        return None
+    
+    try:
+        payload = {
+            'action': 'read_data',
+            'filters': {}
+        }
+        
+        response = requests.post(
+            GOOGLE_SHEET_SCRIPT_URL,
+            json=payload,
+            timeout=30
+        )
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        if result.get('success') and result.get('data'):
+            return result.get('data', [])
+        
+        return []
+    except Exception as e:
+        # Nếu có lỗi, trả về None (không làm gián đoạn flow chính)
+        return None
+
 def get_test_results_from_google_sheet(candidate_id):
-    """Lấy dữ liệu bài test của ứng viên từ Google Sheet"""
+    """Lấy dữ liệu bài test của ứng viên từ Google Sheet theo candidate_id"""
     if not GOOGLE_SHEET_SCRIPT_URL:
         return None
     
@@ -824,6 +852,114 @@ def get_test_results_from_google_sheet(candidate_id):
     except Exception as e:
         # Nếu có lỗi, trả về None (không làm gián đoạn flow chính)
         return None
+
+def find_candidate_id_in_google_sheet(candidate_name, opening_name, similarity_threshold=0.5):
+    """Tìm candidate_id trong Google Sheet bằng cosine similarity với tên ứng viên và vị trí ứng tuyển"""
+    if not GOOGLE_SHEET_SCRIPT_URL or not candidate_name or not opening_name:
+        return None, 0.0, 0.0
+    
+    # Lấy tất cả dữ liệu từ Google Sheet
+    all_data = get_all_test_results_from_google_sheet()
+    
+    if not all_data or not isinstance(all_data, list):
+        return None, 0.0, 0.0
+    
+    # Tạo map từ candidate_id sang record để lấy thông tin ứng viên và vị trí
+    candidate_map = {}
+    for item in all_data:
+        candidate_id = str(item.get('candidate_id', ''))
+        if candidate_id:
+            if candidate_id not in candidate_map:
+                candidate_map[candidate_id] = {
+                    'candidate_id': candidate_id,
+                    'ten_ung_vien': item.get('Tên ứng viên', ''),
+                    'cong_viec_ung_tuyen': item.get('Công việc ứng tuyển', '')
+                }
+    
+    if not candidate_map:
+        return None, 0.0, 0.0
+    
+    # Kiểm tra exact match trước
+    exact_match = next(
+        (c for c in candidate_map.values() 
+         if c.get('ten_ung_vien') == candidate_name and c.get('cong_viec_ung_tuyen') == opening_name),
+        None
+    )
+    if exact_match:
+        return exact_match.get('candidate_id'), 1.0, 1.0
+    
+    # Dùng cosine similarity để tìm ứng viên phù hợp nhất
+    try:
+        # Tạo danh sách tên ứng viên và vị trí ứng tuyển
+        candidate_names = [c.get('ten_ung_vien', '') for c in candidate_map.values()]
+        opening_names = [c.get('cong_viec_ung_tuyen', '') for c in candidate_map.values()]
+        
+        # Kết hợp tên ứng viên và vị trí để tìm kiếm tốt hơn
+        combined_texts = [
+            f"{name} {opening}" 
+            for name, opening in zip(candidate_names, opening_names)
+        ]
+        query_text = f"{candidate_name} {opening_name}"
+        
+        # Vectorize và tính similarity
+        vectorizer = TfidfVectorizer()
+        text_vectors = vectorizer.fit_transform(combined_texts)
+        query_vector = vectorizer.transform([query_text])
+        
+        similarities = cosine_similarity(query_vector, text_vectors).flatten()
+        best_idx = np.argmax(similarities)
+        best_similarity = similarities[best_idx]
+        
+        # Nếu similarity >= threshold, trả về candidate_id đó
+        if best_similarity >= similarity_threshold:
+            candidate_list = list(candidate_map.values())
+            if best_idx < len(candidate_list):
+                best_candidate = candidate_list[best_idx]
+                return best_candidate.get('candidate_id'), float(best_similarity), 0.0
+        
+        return None, float(best_similarity), 0.0
+    except Exception:
+        return None, 0.0, 0.0
+
+def find_test_by_name(test_results, test_name_query, similarity_threshold=0.5):
+    """Tìm bài test cụ thể trong danh sách test_results bằng cosine similarity với test_name_query"""
+    if not test_results or not isinstance(test_results, list):
+        return None, 0.0
+    
+    if not test_name_query:
+        return None, 0.0
+    
+    # Kiểm tra exact match trước
+    exact_match = next((test for test in test_results if test.get('test_name') == test_name_query), None)
+    if exact_match:
+        return exact_match, 1.0
+    
+    # Lấy danh sách test names
+    test_names = [test.get('test_name', '') for test in test_results if test.get('test_name')]
+    
+    if not test_names:
+        return None, 0.0
+    
+    # Dùng cosine similarity để tìm test name gần nhất
+    try:
+        vectorizer = TfidfVectorizer()
+        name_vectors = vectorizer.fit_transform(test_names)
+        query_vector = vectorizer.transform([test_name_query])
+        
+        similarities = cosine_similarity(query_vector, name_vectors).flatten()
+        best_idx = np.argmax(similarities)
+        best_similarity = similarities[best_idx]
+        
+        # Nếu similarity >= threshold, trả về test đó
+        if best_similarity >= similarity_threshold:
+            tests_with_names = [test for test in test_results if test.get('test_name')]
+            if best_idx < len(tests_with_names):
+                best_test = tests_with_names[best_idx]
+                return best_test, float(best_similarity)
+        
+        return None, float(best_similarity)
+    except Exception:
+        return None, 0.0
 
 def get_candidate_details(candidate_id, api_key):
     """Lấy và xử lý dữ liệu chi tiết ứng viên từ API Base.vn, trả về JSON phẳng"""
@@ -960,7 +1096,8 @@ async def root():
             "get_job_description": "/api/opening/job-description?opening_name_or_id={opening_name_or_id}",
             "get_interviews": "/api/interviews",
             "get_candidate_details": "/api/candidate",
-            "get_offer_letter": "/api/offer-letter"
+            "get_offer_letter": "/api/offer-letter",
+            "get_test_result": "/api/test-result"
         },
         "note": "Có thể sử dụng opening_name hoặc opening_id. Hệ thống sẽ tự động tìm opening gần nhất bằng cosine similarity nếu dùng name."
     }
@@ -1341,6 +1478,92 @@ async def get_offer_letter_by_candidate(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Lỗi khi lấy offer letter: {str(e)}")
+
+@app.get("/api/test-result", operation_id="layBaiTestCuTheCuaUngVien")
+async def get_specific_test_result(
+    test_name: str = Query(..., description="Tên bài test cần lấy (dùng similarity để tìm)"),
+    candidate_id: Optional[str] = Query(None, description="ID của ứng viên. Bắt buộc nếu không có opening_name và candidate_name."),
+    opening_name: Optional[str] = Query(None, description="Tên vị trí ứng tuyển để tìm kiếm bằng cosine similarity trong Google Sheet. Bắt buộc nếu không có candidate_id."),
+    candidate_name: Optional[str] = Query(None, description="Tên ứng viên để tìm kiếm bằng cosine similarity trong Google Sheet. Bắt buộc nếu không có candidate_id.")
+):
+    """Lấy bài test cụ thể của ứng viên từ Google Sheet. Có thể tìm bằng candidate_id trực tiếp, hoặc bằng opening_name + candidate_name (dùng cosine similarity trong Google Sheet). Sau đó tìm bài test theo test_name bằng cosine similarity."""
+    try:
+        found_candidate_id = candidate_id
+        candidate_similarity_score = None
+        opening_name_matched = None
+        
+        # Nếu không có candidate_id, phải có cả opening_name và candidate_name để tìm trong Google Sheet
+        if not found_candidate_id:
+            if not opening_name or not candidate_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Phải cung cấp candidate_id, hoặc cả opening_name và candidate_name để tìm trong Google Sheet"
+                )
+            
+            # Tìm candidate_id trong Google Sheet bằng cosine similarity với tên ứng viên và vị trí ứng tuyển
+            found_candidate_id, candidate_similarity_score, _ = find_candidate_id_in_google_sheet(
+                candidate_name,
+                opening_name,
+                similarity_threshold=0.5
+            )
+            
+            if not found_candidate_id:
+                error_msg = f"Không tìm thấy ứng viên phù hợp với tên '{candidate_name}' và vị trí '{opening_name}' trong Google Sheet. "
+                if candidate_similarity_score is not None:
+                    error_msg += f"Similarity score cao nhất: {candidate_similarity_score:.2f}"
+                raise HTTPException(status_code=404, detail=error_msg)
+            
+            opening_name_matched = opening_name
+        
+        # Lấy tất cả bài test của ứng viên từ Google Sheet
+        all_test_results = get_test_results_from_google_sheet(found_candidate_id)
+        
+        if not all_test_results:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Không tìm thấy bài test nào cho ứng viên với ID '{found_candidate_id}' trong Google Sheet"
+            )
+        
+        # Tìm bài test cụ thể theo test_name bằng cosine similarity
+        specific_test, test_similarity = find_test_by_name(all_test_results, test_name, similarity_threshold=0.5)
+        
+        if not specific_test:
+            error_msg = f"Không tìm thấy bài test phù hợp với tên '{test_name}' cho ứng viên với ID '{found_candidate_id}'. "
+            if test_similarity is not None:
+                error_msg += f"Test similarity score cao nhất: {test_similarity:.2f}"
+            raise HTTPException(status_code=404, detail=error_msg)
+        
+        # Lấy thông tin ứng viên từ Google Sheet để trả về
+        all_data = get_all_test_results_from_google_sheet()
+        candidate_name_result = None
+        opening_name_result = opening_name_matched
+        
+        if all_data:
+            for item in all_data:
+                if str(item.get('candidate_id', '')) == str(found_candidate_id):
+                    candidate_name_result = item.get('Tên ứng viên', '')
+                    opening_name_result = item.get('Công việc ứng tuyển', '') or opening_name_matched
+                    break
+        
+        result = {
+            "success": True,
+            "candidate_id": found_candidate_id,
+            "candidate_name": candidate_name_result,
+            "opening_name": opening_name_result,
+            "test_name": specific_test.get('test_name'),
+            "test_result": specific_test,
+            "test_similarity_score": test_similarity
+        }
+        
+        # Thêm thông tin similarity nếu tìm bằng tên
+        if candidate_similarity_score is not None:
+            result["candidate_similarity_score"] = candidate_similarity_score
+        
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy bài test: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
