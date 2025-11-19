@@ -1,37 +1,49 @@
 """
-FastAPI Backend - Trích xuất dữ liệu JD và CV từ Base Hiring API
+FastAPI Backend - Base Hiring API (CustomGPT Optimized Edition)
+Feature: Extract JD, CV, Interviews, Offer Letters, Test Results
+Optimization: ORJSON, Pydantic Aliases, Null filtering
 """
+
+import os
+import re
+import requests
+import numpy as np
+import pdfplumber
+from time import time
+from io import BytesIO
+from html import unescape
+from datetime import datetime, date
+from typing import Optional, List, Dict, Any, Union
+
 from fastapi import FastAPI, Query, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
-from datetime import datetime, date
-import requests
+from fastapi.responses import ORJSONResponse
+from pydantic import BaseModel, Field, ConfigDict
+
 from bs4 import BeautifulSoup
-import os
-from time import time
-import pdfplumber
-from io import BytesIO
+from pytz import timezone
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from google import genai
+from google.genai import types
+
 try:
     from docx import Document
     DOCX_AVAILABLE = True
 except ImportError:
     DOCX_AVAILABLE = False
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
-from google import genai
-from google.genai import types
-from pytz import timezone
-import re
-from html import unescape
+
+# =================================================================
+# 1. CONFIGURATION & APP INIT
+# =================================================================
+
 app = FastAPI(
-    title="Base Hiring API - JD và CV Extractor",
-    description="API để trích xuất dữ liệu JD (Job Description) và CV từ Base Hiring API",
-    version="v2.0.0"
+    title="Base Hiring API - CustomGPT Optimized",
+    description="API trích xuất dữ liệu tuyển dụng Base.vn, tối ưu hóa token cho LLM.",
+    version="v2.1.0",
+    default_response_class=ORJSONResponse  # Tối ưu tốc độ và nén JSON
 )
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -40,27 +52,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration - Load from environment variables
+# Load Environment Variables
 BASE_API_KEY = os.getenv('BASE_API_KEY')
 if not BASE_API_KEY:
-    raise ValueError("BASE_API_KEY chưa được cấu hình trong biến môi trường")
+    raise ValueError("BASE_API_KEY chưa được cấu hình")
 
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY chưa được cấu hình trong biến môi trường")
+    raise ValueError("GEMINI_API_KEY chưa được cấu hình")
 
-# Parse GEMINI_API_KEY_DU_PHONG từ string (comma-separated) sang list
 GEMINI_API_KEY_DU_PHONG_STR = os.getenv('GEMINI_API_KEY_DU_PHONG', '')
 GEMINI_API_KEY_DU_PHONG = [key.strip() for key in GEMINI_API_KEY_DU_PHONG_STR.split(',') if key.strip()] if GEMINI_API_KEY_DU_PHONG_STR else []
 
-# Google Sheet Script URL (optional) - để lấy dữ liệu bài test
 GOOGLE_SHEET_SCRIPT_URL = os.getenv('GOOGLE_SHEET_SCRIPT_URL', None)
-
-# Account API Key (optional) - để lấy thông tin users cho reviews
 ACCOUNT_API_KEY = os.getenv('ACCOUNT_API_KEY', None)
 
-# Cache configuration
-CACHE_TTL = 300  # 5 phút cache
+# Caching System
+CACHE_TTL = 300  # 5 minutes
 _cache = {
     'openings': {'data': None, 'timestamp': 0},
     'job_descriptions': {'data': None, 'timestamp': 0},
@@ -68,1526 +76,631 @@ _cache = {
 }
 
 # =================================================================
-# Helper Functions (Không thay đổi)
+# 2. PYDANTIC MODELS (OPTIMIZED FOR TOKENS)
+# =================================================================
+# ConfigDict(populate_by_name=True) cho phép code Python dùng tên dài (dễ đọc)
+# nhưng khi trả về JSON cho GPT sẽ dùng alias ngắn (tiết kiệm token).
+
+class BaseSchema(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+class SlimOpening(BaseSchema):
+    id: str
+    name: str
+
+class SlimReview(BaseSchema):
+    name: str = Field(..., alias="n")
+    title: Optional[str] = Field(None, alias="t")
+    content: str = Field(..., alias="c")
+
+class SlimTest(BaseSchema):
+    test_name: Optional[str] = Field(None, alias="tn")
+    score: Optional[str] = Field(None, alias="s")
+    link: Optional[str] = Field(None, alias="l")
+    test_content: Optional[str] = Field(None, alias="tc")
+
+class SlimCandidate(BaseSchema):
+    id: str = Field(..., alias="cid")
+    name: str = Field(..., alias="n")
+    email: Optional[str] = Field(None, alias="e")
+    phone: Optional[str] = Field(None, alias="p")
+    cv_url: Optional[str] = Field(None, alias="cv")
+    cv_text: Optional[str] = Field(None, alias="cv_txt")
+    reviews: Optional[List[SlimReview]] = Field(None, alias="revs")
+    stage_name: Optional[str] = Field(None, alias="stg")
+    form_data: Optional[Dict[str, Any]] = Field(None, alias="frm")
+
+# Response Models
+class JDResponse(BaseSchema):
+    found: bool
+    query: Optional[str] = None
+    sim: Optional[float] = None
+    oid: Optional[str] = None
+    oname: Optional[str] = None
+    jd: Optional[str] = None
+    suggestions: Optional[List[SlimOpening]] = None
+
+class ListCandidateResponse(BaseSchema):
+    oid: str
+    oname: str
+    sim: float
+    total: int
+    jd: Optional[str] = None
+    candidates: List[SlimCandidate] = Field(..., alias="cands")
+
+class SlimInterview(BaseSchema):
+    id: str
+    candidate_name: str = Field(..., alias="cn")
+    opening_name: str = Field(..., alias="on")
+    time_dt: Optional[str] = Field(None, alias="dt")
+
+class InterviewResponse(BaseSchema):
+    total: int
+    interviews: List[SlimInterview] = Field(..., alias="ints")
+
+class CandidateDetailResponse(BaseSchema):
+    cid: str
+    details: Dict[str, Any] # Flat dictionary
+    cv_txt: Optional[str] = None
+    tests: Optional[List[SlimTest]] = None
+    jd: Optional[str] = None
+    sim_op: Optional[float] = None
+    sim_cand: Optional[float] = None
+
+class OfferLetterResponse(BaseSchema):
+    cid: str
+    cname: str = Field(..., alias="n")
+    position: str = Field(..., alias="pos")
+    letter_text: str = Field(..., alias="txt")
+    letter_url: Optional[str] = Field(None, alias="url")
+    sim_op: Optional[float] = None
+    sim_cand: Optional[float] = None
+
+class TestResultResponse(BaseSchema):
+    cid: str
+    cname: Optional[str] = Field(None, alias="n")
+    test_name: Optional[str] = Field(None, alias="tn")
+    result: Optional[SlimTest] = Field(None, alias="res")
+    sim_test: Optional[float] = None
+    sim_cand: Optional[float] = None
+
+# =================================================================
+# 3. HELPER FUNCTIONS (LOGIC CORE)
 # =================================================================
 
+def remove_html_tags(text):
+    if not text: return ""
+    text = re.sub(r'<br\s*/?>', '\n', text)
+    text = re.sub(r'<[^>]+>', '', text)
+    return unescape(text).strip()
+
 def get_base_openings(api_key, use_cache=True):
-    """Truy xuất vị trí tuyển dụng đang hoạt động từ Base API (có cache)"""
     current_time = time()
-    if not api_key:
-        raise HTTPException(status_code=500, detail="BASE_API_KEY chưa được cấu hình")
-    
-    # Kiểm tra cache nếu được bật
     if use_cache and _cache['openings']['data'] is not None:
         if current_time - _cache['openings']['timestamp'] < CACHE_TTL:
             return _cache['openings']['data']
     
-    url = "https://hiring.base.vn/publicapi/v2/opening/list"
-    payload = {'access_token': api_key}
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    
     try:
-        response = requests.post(url, headers=headers, data=payload, timeout=10)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=503, detail=f"Lỗi kết nối đến Base API: {e}")
-
-    data = response.json()
-    openings = data.get('openings', [])
-    
-    # Lọc vị trí với trạng thái '10' (đang hoạt động)
-    filtered_openings = [
-        {"id": opening['id'], "name": opening['name']}
-        for opening in openings
-        if opening.get('status') == '10'
-    ]
-    
-    # Lưu vào cache
-    if use_cache:
-        _cache['openings'] = {'data': filtered_openings, 'timestamp': current_time}
-    
-    return filtered_openings
+        url = "https://hiring.base.vn/publicapi/v2/opening/list"
+        resp = requests.post(url, headers={'Content-Type': 'application/x-www-form-urlencoded'}, data={'access_token': api_key}, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        filtered = [{"id": o['id'], "name": o['name']} for o in data.get('openings', []) if o.get('status') == '10']
+        if use_cache:
+            _cache['openings'] = {'data': filtered, 'timestamp': current_time}
+        return filtered
+    except Exception:
+        return []
 
 def get_job_descriptions(api_key, use_cache=True):
-    """Truy xuất JD (Job Description) từ các vị trí tuyển dụng đang mở (có cache)"""
     current_time = time()
-    if not api_key:
-        raise HTTPException(status_code=500, detail="BASE_API_KEY chưa được cấu hình")
-
-    # Kiểm tra cache
     if use_cache and _cache['job_descriptions']['data'] is not None:
         if current_time - _cache['job_descriptions']['timestamp'] < CACHE_TTL:
             return _cache['job_descriptions']['data']
     
-    url = "https://hiring.base.vn/publicapi/v2/opening/list"
-    payload = {'access_token': api_key}
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-
     try:
-        response = requests.post(url, headers=headers, data=payload, timeout=10)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=503, detail=f"Lỗi kết nối đến Base API: {e}")
-
-    data = response.json()
-    
-    if 'openings' in data:
-        openings = data['openings']
+        resp = requests.post("https://hiring.base.vn/publicapi/v2/opening/list", data={'access_token': api_key}, timeout=15)
+        data = resp.json()
         results = []
-        
-        for opening in openings:
-            if opening.get('status') == '10':  # Chỉ lấy vị trí đang mở
-                html_content = opening.get('content', '')
-                soup = BeautifulSoup(html_content, "html.parser")
-                text_content = soup.get_text()
-                
-                if len(text_content) >= 10:  # Chỉ lấy JD có nội dung đủ dài
-                    results.append({
-                        "id": opening['id'],
-                        "name": opening['name'],
-                        "job_description": text_content.strip(),
-                        "html_content": html_content
-                    })
-        
+        for op in data.get('openings', []):
+            if op.get('status') == '10':
+                soup = BeautifulSoup(op.get('content', ''), "html.parser")
+                text = soup.get_text()
+                if len(text) >= 10:
+                    results.append({"id": op['id'], "name": op['name'], "job_description": text.strip()})
         if use_cache:
             _cache['job_descriptions'] = {'data': results, 'timestamp': current_time}
-        
         return results
-    return []
-
-def extract_message(evaluations):
-    """Trích xuất nội dung văn bản từ đánh giá HTML"""
-    if isinstance(evaluations, list) and len(evaluations) > 0:
-        raw_html = evaluations[0].get('content', '')
-        soup = BeautifulSoup(raw_html, "html.parser")
-        text = " ".join(soup.stripped_strings)
-        return text
-    return None
-
-def remove_html_tags(text):
-    """Bỏ HTML tags và chuyển đổi thành text thuần túy"""
-    if not text:
-        return ""
-    # Chuyển các thẻ <br> thành xuống dòng
-    text = re.sub(r'<br\s*/?>', '\n', text)
-    # Bỏ tất cả các thẻ HTML còn lại
-    text = re.sub(r'<[^>]+>', '', text)
-    # Unescape các ký tự HTML entities (&lt;, &gt;, &amp;, etc.)
-    text = unescape(text)
-    # Loại bỏ các khoảng trắng thừa
-    text = re.sub(r'\n\s*\n', '\n', text)
-    return text.strip()
+    except Exception:
+        return []
 
 def get_users_info(use_cache=True):
-    """Lấy thông tin users từ Account API và map username -> name + title (có cache)"""
-    if not ACCOUNT_API_KEY:
-        return {}
-    
+    if not ACCOUNT_API_KEY: return {}
     current_time = time()
-    
-    # Kiểm tra cache
     if use_cache and _cache['users_info']['data'] is not None:
-        if current_time - _cache['users_info']['timestamp'] < CACHE_TTL:
-            return _cache['users_info']['data']
-    
+        if current_time - _cache['users_info']['timestamp'] < CACHE_TTL: return _cache['users_info']['data']
     try:
-        users_url = "https://account.base.vn/extapi/v1/users"
-        users_payload = {'access_token': ACCOUNT_API_KEY}
-        users_response = requests.post(users_url, data=users_payload, timeout=10)
-        users_response.raise_for_status()
-        users_data = users_response.json()
-        
-        # Tạo dictionary để map username -> name + title
-        username_to_info = {}
-        if 'users' in users_data and isinstance(users_data['users'], list):
-            for user in users_data['users']:
-                username = user.get('username')
-                name = user.get('name', '')
-                title = user.get('title', '')
-                if username:
-                    # Nếu là Hoang Tran thì thay title thành CEO
-                    if name == "Hoang Tran":
-                        title = "CEO"
-                    
-                    # Kết hợp name và title
-                    if title:
-                        username_to_info[username] = {"name": name, "title": title}
-                    else:
-                        username_to_info[username] = {"name": name, "title": ""}
-        
-        # Lưu vào cache
-        if use_cache:
-            _cache['users_info'] = {'data': username_to_info, 'timestamp': current_time}
-        
-        return username_to_info
-    except Exception as e:
-        # Nếu có lỗi, trả về dict rỗng
-        return {}
+        resp = requests.post("https://account.base.vn/extapi/v1/users", data={'access_token': ACCOUNT_API_KEY}, timeout=10)
+        users = resp.json().get('users', [])
+        info = {}
+        for u in users:
+            username = u.get('username')
+            if username:
+                info[username] = {"name": u.get('name', ''), "title": "CEO" if u.get('name') == "Hoang Tran" else u.get('title', '')}
+        if use_cache: _cache['users_info'] = {'data': info, 'timestamp': current_time}
+        return info
+    except: return {}
 
 def process_evaluations(evaluations):
-    """Xử lý evaluations và trả về danh sách reviews với đầy đủ thông tin (tên, chức danh, nội dung)"""
-    if not isinstance(evaluations, list) or len(evaluations) == 0:
-        return []
-    
-    # Lấy thông tin users
-    username_to_info = get_users_info(use_cache=True)
-    
+    if not evaluations: return []
+    user_info_map = get_users_info()
     reviews = []
-    for eval_item in evaluations:
-        if 'content' in eval_item:
-            # Bỏ HTML tags
-            clean_content = remove_html_tags(eval_item.get('content', ''))
-            
-            # Lấy username và chuyển thành tên thật + chức danh
-            username = eval_item.get('username')
-            user_info = username_to_info.get(username, {}) if username else {}
-            name = user_info.get('name', username) if user_info else (username if username else "N/A")
-            title = user_info.get('title', '') if user_info else ''
-            
-            review = {
-                "id": eval_item.get('id'),
-                "name": name,
-                "title": title,
-                "content": clean_content
-            }
-            reviews.append(review)
-    
+    for e in evaluations:
+        if 'content' in e:
+            u = e.get('username')
+            ui = user_info_map.get(u, {})
+            reviews.append({
+                "name": ui.get('name', u or "N/A"),
+                "title": ui.get('title', ''),
+                "content": remove_html_tags(e.get('content', ''))
+            })
     return reviews
 
 def extract_text_from_pdf(url=None, file_bytes=None):
-    """Trích xuất text từ PDF URL hoặc file bytes bằng pdfplumber"""
-    pdf_file = None
-    if file_bytes:
-        pdf_file = file_bytes
-    elif url:
+    pdf_file = file_bytes
+    if not pdf_file and url:
         try:
-            response = requests.get(url, timeout=30)
-            response.raise_for_status()
-            pdf_file = BytesIO(response.content)
-        except Exception:
-            return None
-    else:
-        return None
-    
+            r = requests.get(url, timeout=30)
+            pdf_file = BytesIO(r.content)
+        except: return None
+    if not pdf_file: return None
     try:
         text = ""
         with pdfplumber.open(pdf_file) as pdf:
-            for page_num, page in enumerate(pdf.pages, 1):
-                page_text = page.extract_text()
-                if page_text:
-                    text += f"\n--- Trang {page_num} ---\n"
-                    text += page_text
+            for p in pdf.pages:
+                extracted = p.extract_text()
+                if extracted: text += extracted + "\n"
         return text.strip() if text else None
-    except Exception as e:
-        return None
-
-def extract_text_from_docx(file_bytes):
-    """Trích xuất text từ DOCX file bytes"""
-    if not DOCX_AVAILABLE:
-        return None
-    try:
-        doc = Document(file_bytes)
-        text = "\n".join([p.text for p in doc.paragraphs]).strip()
-        return text if text else None
-    except Exception as e:
-        return None
-
-def download_file_to_bytes(url):
-    """Tải file từ URL và trả về BytesIO"""
-    if not url:
-        return None
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        response = requests.get(url, headers=headers, timeout=20)
-        response.raise_for_status()
-        return BytesIO(response.content)
-    except Exception:
-        return None
-
-def is_target_file(url, name):
-    """Kiểm tra xem file có phải PDF/DOCX/DOC không"""
-    if not url or not name:
-        return False
-    url_low = url.lower().split('?')[0]
-    name_low = name.lower()
-    return url_low.endswith(('.pdf', '.docx', '.doc')) or name_low.endswith(('.pdf', '.docx', '.doc'))
-
-def find_files_in_html(html_content):
-    """Tìm các file PDF/DOCX/DOC trong HTML content"""
-    found = []
-    if not html_content:
-        return found
-    try:
-        soup = BeautifulSoup(html_content, 'html.parser')
-        for a in soup.find_all('a', href=True):
-            href = a['href'].strip()
-            name = a.get_text().strip() or href.split('/')[-1]
-            if is_target_file(href, name):
-                found.append((href, name))
-        return found
-    except Exception:
-        return found
-
-def get_offer_letter(candidate_id, api_key):
-    """Lấy offer letter từ messages API của ứng viên"""
-    if not candidate_id or not api_key:
-        return None
-    
-    try:
-        url = "https://hiring.base.vn/publicapi/v2/candidate/messages"
-        payload = {
-            'access_token': api_key,
-            'id': candidate_id
-        }
-        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-        
-        response = requests.post(url, headers=headers, data=payload, timeout=15)
-        response.raise_for_status()
-        data = response.json()
-        
-        if not data or 'messages' not in data:
-            return None
-        
-        messages = data['messages']
-        if not messages:
-            return None
-        
-        # Duyệt từ tin nhắn mới nhất về cũ nhất
-        for msg in messages:
-            # Ưu tiên tìm trong attachments
-            priority_files = []
-            if msg.get('has_attachment', 0) > 0:
-                for att in msg.get('attachments', []):
-                    url_att = att.get('src') or att.get('url') or att.get('org')
-                    name_att = att.get('name', 'unknown')
-                    if url_att and is_target_file(url_att, name_att):
-                        priority_files.append((url_att, name_att))
-            
-            # Nếu không có trong attachments, tìm trong HTML content
-            secondary_files = []
-            if not priority_files:
-                secondary_files = find_files_in_html(msg.get('content', ''))
-            
-            all_files = priority_files + secondary_files
-            if not all_files:
-                continue
-            
-            # Thử tải và trích xuất file đầu tiên tìm được
-            for file_url, file_name in all_files:
-                file_bytes = download_file_to_bytes(file_url)
-                if not file_bytes:
-                    continue
-                
-                ext = file_name.lower().split('.')[-1] if '.' in file_name else file_url.split('.')[-1].split('?')[0].lower()
-                text = None
-                
-                if 'pdf' in ext:
-                    text = extract_text_from_pdf(file_bytes=file_bytes)
-                elif 'docx' in ext and DOCX_AVAILABLE:
-                    text = extract_text_from_docx(file_bytes)
-                elif 'doc' == ext:
-                    text = None  # File .doc cũ, không hỗ trợ
-                
-                if text:
-                    return {
-                        "url": file_url,
-                        "name": file_name,
-                        "text": text
-                    }
-        
-        return None
-    except Exception as e:
-        # Nếu có lỗi, trả về None (không làm gián đoạn flow chính)
-        return None
+    except: return None
 
 def extract_text_from_cv_url_with_genai(url):
-    """Trích xuất text từ CV URL, ưu tiên pdfplumber, fallback về Google Gemini AI"""
-    if not url:
-        return None
+    if not url: return None
+    text = extract_text_from_pdf(url)
+    if text: return text
     
-    # Tạm thời ưu tiên sử dụng pdfplumber trước
-    pdf_text = extract_text_from_pdf(url)
-    if pdf_text:
-        return pdf_text
-    
-    # Nếu pdfplumber không thành công, fallback về Gemini AI
-    api_keys_to_try = [GEMINI_API_KEY] + GEMINI_API_KEY_DU_PHONG
-    
-    for idx, api_key in enumerate(api_keys_to_try):
+    keys = [GEMINI_API_KEY] + GEMINI_API_KEY_DU_PHONG
+    for api_key in keys:
         try:
             client = genai.Client(api_key=api_key)
-            
-            model = "gemini-flash-lite-latest"
-            contents = [
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_text(text=f"{url}\nĐọc text từ url"),
-                    ],
-                ),
-            ]
-            tools = [
-                types.Tool(url_context=types.UrlContext()),
-            ]
-            generate_content_config = types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(
-                    thinking_budget=0,
-                ),
-                tools=tools,
-                system_instruction=[
-                    types.Part.from_text(text="Nội dung text trong link"),
-                ],
-            )
-            
-            # Thu thập tất cả text từ stream
-            text_content = ""
-            for chunk in client.models.generate_content_stream(
-                model=model,
-                contents=contents,
-                config=generate_content_config,
-            ):
-                if chunk.text:
-                    text_content += chunk.text
-            
-            if text_content.strip():
-                return text_content.strip()
-                
+            contents = [types.Content(role="user", parts=[types.Part.from_text(text=f"{url}\nĐọc toàn bộ text trong file này")])]
+            tools = [types.Tool(url_context=types.UrlContext())]
+            conf = types.GenerateContentConfig(tools=tools, system_instruction=[types.Part.from_text(text="Trích xuất full text.")])
+            full_text = ""
+            for chunk in client.models.generate_content_stream(model="gemini-flash-lite-latest", contents=contents, config=conf):
+                if chunk.text: full_text += chunk.text
+            if full_text.strip(): return full_text.strip()
         except Exception as e:
-            error_str = str(e).lower()
-            error_repr = repr(e).lower()
-            
-            # Kiểm tra nếu là lỗi 429 (rate limit)
-            is_rate_limit = (
-                '429' in error_str or 
-                '429' in error_repr or
-                'rate limit' in error_str or
-                'rate_limit' in error_str or
-                'quota exceeded' in error_str or
-                'resource exhausted' in error_str
-            )
-            
-            # Nếu là lỗi 429 và còn API key khác, thử key tiếp theo
-            if is_rate_limit and idx < len(api_keys_to_try) - 1:
-                continue
-            
-            # Nếu không phải lỗi 429 hoặc đã hết key, tiếp tục thử key tiếp theo
-            continue
-    
-    # Nếu tất cả đều fail, trả về None
+            if '429' in str(e) or 'rate' in str(e).lower(): continue
+            pass
     return None
 
-def find_opening_id_by_name(query_name, api_key, similarity_threshold=0.5):
-    """Tìm opening_id gần nhất với query_name bằng cosine similarity"""
-    openings = get_base_openings(api_key, use_cache=True)
-    
-    if not openings:
-        return None, None, 0.0
-    
-    # Nếu tìm thấy chính xác theo id hoặc name
-    exact_match = next((op for op in openings if op['id'] == query_name or op['name'] == query_name), None)
-    if exact_match:
-        return exact_match['id'], exact_match['name'], 1.0
-    
-    # Nếu không tìm thấy chính xác, dùng cosine similarity
-    opening_names = [op['name'] for op in openings]
-    
-    if not opening_names:
-        return None, None, 0.0
-    
-    # Vectorize các tên opening
-    vectorizer = TfidfVectorizer()
+def find_opening_id_by_name(query, api_key, threshold=0.5):
+    openings = get_base_openings(api_key)
+    if not openings: return None, None, 0.0
+    exact = next((o for o in openings if o['id'] == query or o['name'] == query), None)
+    if exact: return exact['id'], exact['name'], 1.0
+    names = [o['name'] for o in openings]
     try:
-        name_vectors = vectorizer.fit_transform(opening_names)
-        query_vector = vectorizer.transform([query_name])
-        
-        # Tính cosine similarity
-        similarities = cosine_similarity(query_vector, name_vectors).flatten()
-        
-        # Tìm index có similarity cao nhất
-        best_idx = np.argmax(similarities)
-        best_similarity = similarities[best_idx]
-        
-        # Nếu similarity >= threshold, trả về opening đó
-        if best_similarity >= similarity_threshold:
-            best_opening = openings[best_idx]
-            return best_opening['id'], best_opening['name'], float(best_similarity)
-        else:
-            return None, None, float(best_similarity)
-    except Exception:
-        # Nếu có lỗi trong vectorization, trả về None
-        return None, None, 0.0
+        vec = TfidfVectorizer()
+        tfidf = vec.fit_transform(names + [query])
+        sims = cosine_similarity(tfidf[-1], tfidf[:-1]).flatten()
+        idx = np.argmax(sims)
+        best_sim = sims[idx]
+        if best_sim >= threshold:
+            return openings[idx]['id'], openings[idx]['name'], float(best_sim)
+        return None, None, float(best_sim)
+    except: return None, None, 0.0
 
-def find_candidate_by_name_in_opening(candidate_name, opening_id, api_key, similarity_threshold=0.5, filter_stages=None):
-    """Tìm candidate_id dựa trên tên ứng viên trong một opening cụ thể bằng cosine similarity.
-    
-    Args:
-        candidate_name: Tên ứng viên cần tìm
-        opening_id: ID của opening
-        api_key: API key để gọi Base API
-        similarity_threshold: Ngưỡng similarity tối thiểu (mặc định 0.5)
-        filter_stages: Danh sách stage names để lọc. 
-                      - None = không lọc stage, tìm trong tất cả stage (dùng cho /api/candidate)
-                      - ['Offered', 'Hired'] = chỉ tìm trong stage "Offered" và "Hired" (chỉ dùng cho /api/offer-letter)
-    """
-    if not candidate_name or not opening_id:
-        return None, 0.0
-    
-    # Lấy danh sách candidates của opening đó
-    url = "https://hiring.base.vn/publicapi/v2/candidate/list"
-    payload = {
-        'access_token': api_key,
-        'opening_id': opening_id,
-    }
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    
+def find_candidate_by_name_in_opening(c_name, op_id, api_key, threshold=0.5, filter_stages=None):
+    if not c_name or not op_id: return None, 0.0
     try:
-        response = requests.post(url, headers=headers, data=payload, timeout=15)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        return None, 0.0
-    
-    data = response.json()
-    if 'candidates' not in data or not data['candidates']:
-        return None, 0.0
-    
-    # Lọc theo stage nếu có filter_stages (chỉ dùng cho endpoint /api/offer-letter)
-    # Endpoint /api/candidate luôn truyền filter_stages=None để tìm trong tất cả stage
+        resp = requests.post("https://hiring.base.vn/publicapi/v2/candidate/list", 
+                             data={'access_token': api_key, 'opening_id': op_id}, timeout=15)
+        cands = resp.json().get('candidates', [])
+    except: return None, 0.0
+
     if filter_stages:
-        filtered_candidates = []
-        for candidate in data['candidates']:
-            stage_name = candidate.get('stage_name', '')
-            if stage_name and stage_name in filter_stages:
-                filtered_candidates.append(candidate)
-        
-        if not filtered_candidates:
-            return None, 0.0
-    else:
-        # Không lọc stage, lấy tất cả candidates
-        filtered_candidates = data['candidates']
+        cands = [c for c in cands if c.get('stage_name') in filter_stages]
+    if not cands: return None, 0.0
     
-    # Tìm candidate bằng tên với cosine similarity trong danh sách đã lọc
-    candidate_names = [c.get('name', '') for c in filtered_candidates if c.get('name')]
-    
-    if not candidate_names:
-        return None, 0.0
-    
-    # Kiểm tra exact match trước
-    exact_match = next((c for c in filtered_candidates if c.get('name') == candidate_name), None)
-    if exact_match:
-        return exact_match.get('id'), 1.0
-    
-    # Dùng cosine similarity để tìm candidate name gần nhất
-    try:
-        vectorizer = TfidfVectorizer()
-        name_vectors = vectorizer.fit_transform(candidate_names)
-        query_vector = vectorizer.transform([candidate_name])
-        
-        similarities = cosine_similarity(query_vector, name_vectors).flatten()
-        best_idx = np.argmax(similarities)
-        best_similarity = similarities[best_idx]
-        
-        # Nếu similarity >= threshold, trả về candidate đó
-        if best_similarity >= similarity_threshold:
-            candidates_with_names = [c for c in filtered_candidates if c.get('name')]
-            if best_idx < len(candidates_with_names):
-                best_candidate = candidates_with_names[best_idx]
-                return best_candidate.get('id'), float(best_similarity)
-        
-        return None, float(best_similarity)
-    except Exception:
-        return None, 0.0
+    exact = next((c for c in cands if c.get('name') == c_name), None)
+    if exact: return exact.get('id'), 1.0
 
-def get_candidates_for_opening(opening_id, api_key, start_date=None, end_date=None, stage_name=None):
-    """Truy xuất ứng viên cho một vị trí tuyển dụng cụ thể trong khoảng thời gian (luôn có cv_text)"""
-    url = "https://hiring.base.vn/publicapi/v2/candidate/list"
+    names = [c.get('name', '') for c in cands]
+    try:
+        vec = TfidfVectorizer()
+        tfidf = vec.fit_transform(names + [c_name])
+        sims = cosine_similarity(tfidf[-1], tfidf[:-1]).flatten()
+        idx = np.argmax(sims)
+        best_sim = sims[idx]
+        if best_sim >= threshold:
+            return cands[idx].get('id'), float(best_sim)
+        return None, float(best_sim)
+    except: return None, 0.0
+
+def get_test_results_from_google_sheet(cid):
+    if not GOOGLE_SHEET_SCRIPT_URL: return None
+    try:
+        resp = requests.post(GOOGLE_SHEET_SCRIPT_URL, json={'action': 'read_data', 'filters': {'candidate_id': str(cid)}}, timeout=8)
+        data = resp.json().get('data', [])
+        # Convert keys to English for Pydantic mapping
+        results = []
+        for i in data:
+            results.append({
+                "test_name": i.get('Tên bài test'),
+                "score": i.get('Score'),
+                "link": i.get('Link'),
+                "test_content": i.get('test content')
+            })
+        return results if results else None
+    except: return None
+
+def find_test_by_name(tests, query, threshold=0.5):
+    if not tests or not query: return None, 0.0
+    exact = next((t for t in tests if t.get('test_name') == query), None)
+    if exact: return exact, 1.0
     
-    payload = {
-        'access_token': api_key,
-        'opening_id': opening_id,
+    names = [t.get('test_name', '') for t in tests if t.get('test_name')]
+    try:
+        vec = TfidfVectorizer()
+        tfidf = vec.fit_transform(names + [query])
+        sims = cosine_similarity(tfidf[-1], tfidf[:-1]).flatten()
+        idx = np.argmax(sims)
+        if sims[idx] >= threshold:
+            match_name = names[idx]
+            return next((t for t in tests if t.get('test_name') == match_name), None), float(sims[idx])
+        return None, float(sims[idx])
+    except: return None, 0.0
+
+def download_file_to_bytes(url):
+    try:
+        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
+        return BytesIO(r.content) if r.status_code == 200 else None
+    except: return None
+
+def extract_text_doc_pdf(url, name):
+    if not url: return None
+    file_bytes = download_file_to_bytes(url)
+    if not file_bytes: return None
+    
+    ext = name.lower().split('.')[-1] if '.' in name else 'pdf'
+    if 'pdf' in ext: return extract_text_from_pdf(file_bytes=file_bytes)
+    if 'docx' in ext and DOCX_AVAILABLE:
+        try: return "\n".join([p.text for p in Document(file_bytes).paragraphs]).strip()
+        except: return None
+    return None
+
+def get_offer_letter(cid, api_key):
+    try:
+        resp = requests.post("https://hiring.base.vn/publicapi/v2/candidate/messages", 
+                             data={'access_token': api_key, 'id': cid}, timeout=15)
+        msgs = resp.json().get('messages', [])
+        for m in msgs:
+            # Attachments
+            if m.get('has_attachment'):
+                for att in m.get('attachments', []):
+                    url = att.get('src') or att.get('url')
+                    name = att.get('name', '')
+                    if url and any(x in name.lower() for x in ['.pdf', '.docx']):
+                        txt = extract_text_doc_pdf(url, name)
+                        if txt: return {"url": url, "name": name, "text": txt}
+            # HTML Links
+            if m.get('content'):
+                soup = BeautifulSoup(m['content'], 'html.parser')
+                for a in soup.find_all('a', href=True):
+                    url = a['href']
+                    name = a.get_text()
+                    if any(x in url.lower() for x in ['.pdf', '.docx']):
+                        txt = extract_text_doc_pdf(url, name)
+                        if txt: return {"url": url, "name": name, "text": txt}
+        return None
+    except: return None
+
+def get_candidate_details_full(cid, api_key):
+    try:
+        resp = requests.post("https://hiring.base.vn/publicapi/v2/candidate/get", data={'access_token': api_key, 'id': cid}, timeout=15)
+        raw = resp.json()
+    except: raise HTTPException(503, "Base API Error")
+    
+    if raw.get('code') != 1 or not raw.get('candidate'): raise HTTPException(404, "Not found")
+    c = raw['candidate']
+    
+    flat = {
+        'id': c.get('id'),
+        'ten': c.get('name'),
+        'email': c.get('email'),
+        'phone': c.get('phone'),
+        'opening_name': (c.get('evaluations') or [{}])[0].get('opening_export', {}).get('name', c.get('title')),
+        'opening_id': (c.get('evaluations') or [{}])[0].get('opening_export', {}).get('id'),
+        'stage': c.get('stage_name', c.get('status')),
+        'cv_url': (c.get('cvs') or [None])[0],
+        'reviews': process_evaluations(c.get('evaluations', []))
     }
-    
-    if start_date:
-        payload['start_date'] = start_date.strftime('%Y-%m-%d') if isinstance(start_date, date) else start_date
-    if end_date:
-        payload['end_date'] = end_date.strftime('%Y-%m-%d') if isinstance(end_date, date) else end_date
-    
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    
-    try:
-        response = requests.post(url, headers=headers, data=payload, timeout=15)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=503, detail=f"Lỗi kết nối đến Base API khi lấy ứng viên: {e}")
-
-    data = response.json()
-    if 'candidates' in data and data['candidates']:
-        # Nếu có stage_name, tìm các stage name phù hợp bằng cosine similarity
-        matching_stage_names = None
-        if stage_name is not None:
-            # Thu thập tất cả stage_name unique từ candidates
-            all_stage_names = list(set([
-                candidate.get('stage_name', '') 
-                for candidate in data['candidates'] 
-                if candidate.get('stage_name')
-            ]))
-            
-            if not all_stage_names:
-                # Nếu không có stage_name nào, lấy tất cả
-                matching_stage_names = None
-            else:
-                # Kiểm tra exact match trước
-                if stage_name in all_stage_names:
-                    matching_stage_names = [stage_name]
-                else:
-                    # Dùng cosine similarity để tìm stage name gần nhất
-                    try:
-                        vectorizer = TfidfVectorizer()
-                        stage_vectors = vectorizer.fit_transform(all_stage_names)
-                        query_vector = vectorizer.transform([stage_name])
-                        
-                        similarities = cosine_similarity(query_vector, stage_vectors).flatten()
-                        best_idx = np.argmax(similarities)
-                        best_similarity = similarities[best_idx]
-                        
-                        # Nếu similarity >= 0.3, lấy stage name đó (ngưỡng thấp để bao quát hơn)
-                        if best_similarity >= 0.3:
-                            matching_stage_names = [all_stage_names[best_idx]]
-                        else:
-                            # Nếu không tìm thấy gì phù hợp, lấy tất cả
-                            matching_stage_names = None
-                    except Exception:
-                        # Nếu có lỗi trong vectorization, lấy tất cả
-                        matching_stage_names = None
-        
-        # Bước 1: Lọc ứng viên theo stage_name trước (chưa trích xuất cv_text để tiết kiệm request)
-        filtered_candidates = []
-        for candidate in data['candidates']:
-            # Lọc theo stage_name nếu có matching_stage_names
-            if matching_stage_names is not None:
-                candidate_stage_name = candidate.get('stage_name', '')
-                if candidate_stage_name not in matching_stage_names:
-                    continue
-            
-            filtered_candidates.append(candidate)
-        
-        # Bước 2: Trích xuất cv_text chỉ cho các ứng viên đã được lọc
-        candidates = []
-        for candidate in filtered_candidates:
-            cv_urls = candidate.get('cvs', [])
-            cv_url = cv_urls[0] if isinstance(cv_urls, list) and len(cv_urls) > 0 else None
-            
-            # Chỉ trích xuất cv_text từ CV URL sau khi đã lọc xong (tiết kiệm request Gemini)
-            cv_text = None
-            if cv_url:
-                cv_text = extract_text_from_cv_url_with_genai(cv_url)
-            
-            # Xử lý evaluations để lấy reviews chi tiết
-            reviews = process_evaluations(candidate.get('evaluations', []))
-            # Giữ lại review cũ (text đơn giản) để tương thích ngược
-            review = extract_message(candidate.get('evaluations', []))
-            
-            form_data = {}
-            if 'form' in candidate and isinstance(candidate['form'], list):
-                for item in candidate['form']:
-                    if isinstance(item, dict) and 'id' in item and 'value' in item:
-                        form_data[item['id']] = item['value']
-            
-            # Lấy dữ liệu bài test từ Google Sheet
-            test_results = get_test_results_from_google_sheet(candidate.get('id'))
-            
-            candidate_info = {
-                "id": candidate.get('id'),
-                "name": candidate.get('name'),
-                "email": candidate.get('email'),
-                "phone": candidate.get('phone'),
-                "gender": candidate.get('gender'),
-                "cv_url": cv_url,
-                "cv_text": cv_text,
-                "review": review,  # Giữ lại để tương thích ngược
-                "reviews": reviews,  # Danh sách reviews chi tiết với tên, chức danh, nội dung
-                "form_data": form_data,
-                "opening_id": opening_id,
-                "stage_id": candidate.get('stage_id'),
-                "stage_name": candidate.get('stage_name'),
-                "test_results": test_results
-            }
-            
-            candidates.append(candidate_info)
-        
-        return candidates
-    return []
-
-def get_interviews(api_key, start_date=None, end_date=None, opening_id=None, filter_date=None):
-    """Truy xuất lịch phỏng vấn từ Base API, chỉ trả về các trường quan trọng. Lọc dựa trên date của time_dt nếu có filter_date."""
-    url = "https://hiring.base.vn/publicapi/v2/interview/list"
-    
-    payload = {
-        'access_token': api_key,
-    }
-    
-    # Không truyền start_date/end_date vào API Base, sẽ lọc sau khi chuyển đổi time_dt
-    # Chỉ dùng để API Base lọc sơ bộ nếu cần
-    
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    
-    try:
-        response = requests.post(url, headers=headers, data=payload, timeout=15)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=503, detail=f"Lỗi kết nối đến Base API khi lấy lịch phỏng vấn: {e}")
-
-    data = response.json()
-    if 'interviews' in data and data['interviews']:
-        interviews = data['interviews']
-        
-        # Nếu có opening_id, lọc theo opening_id
-        if opening_id:
-            interviews = [
-                interview for interview in interviews
-                if interview.get('opening_id') == opening_id
-            ]
-        
-        # Xử lý và chỉ lấy các trường quan trọng
-        processed_interviews = []
-        hcm_tz = timezone('Asia/Ho_Chi_Minh')
-        
-        for interview in interviews:
-            # Chỉ lấy các trường quan trọng
-            processed_interview = {
-                'id': interview.get('id'),
-                'candidate_id': interview.get('candidate_id'),
-                'candidate_name': interview.get('candidate_name'),
-                'opening_name': interview.get('opening_name'),
-                'time_dt': None
-            }
-            
-            # Chuyển đổi timestamp 'time' sang datetime với timezone Asia/Ho_Chi_Minh
-            time_dt_date = None
-            if 'time' in interview and interview.get('time'):
-                try:
-                    timestamp = int(interview['time'])
-                    dt = datetime.fromtimestamp(timestamp, tz=timezone('UTC'))
-                    dt_hcm = dt.astimezone(hcm_tz)
-                    processed_interview['time_dt'] = dt_hcm.isoformat()
-                    time_dt_date = dt_hcm.date()  # Lấy date để lọc
-                except (ValueError, TypeError, OSError):
-                    pass
-            
-            # Lọc dựa trên date của time_dt
-            if filter_date:
-                if time_dt_date is None or time_dt_date != filter_date:
-                    continue  # Bỏ qua nếu không có time_dt hoặc date không khớp
-            
-            processed_interviews.append(processed_interview)
-        
-        return processed_interviews
-    
-    return []
-
-def get_all_test_results_from_google_sheet():
-    """Lấy tất cả dữ liệu bài test từ Google Sheet"""
-    if not GOOGLE_SHEET_SCRIPT_URL:
-        return None
-    
-    try:
-        payload = {
-            'action': 'read_data',
-            'filters': {}
-        }
-        
-        response = requests.post(
-            GOOGLE_SHEET_SCRIPT_URL,
-            json=payload,
-            timeout=30
-        )
-        response.raise_for_status()
-        
-        result = response.json()
-        
-        if result.get('success') and result.get('data'):
-            return result.get('data', [])
-        
-        return []
-    except Exception as e:
-        # Nếu có lỗi, trả về None (không làm gián đoạn flow chính)
-        return None
-
-def get_test_results_from_google_sheet(candidate_id):
-    """Lấy dữ liệu bài test của ứng viên từ Google Sheet theo candidate_id"""
-    if not GOOGLE_SHEET_SCRIPT_URL:
-        return None
-    
-    try:
-        payload = {
-            'action': 'read_data',
-            'filters': {
-                'candidate_id': str(candidate_id)
-            }
-        }
-        
-        response = requests.post(
-            GOOGLE_SHEET_SCRIPT_URL,
-            json=payload,
-            timeout=10
-        )
-        response.raise_for_status()
-        
-        result = response.json()
-        
-        if result.get('success') and result.get('data'):
-            # Trả về danh sách bài test của ứng viên
-            test_results = []
-            for item in result.get('data', []):
-                test_result = {
-                    'test_name': item.get('Tên bài test', ''),
-                    'score': item.get('Score', ''),
-                    'time': item.get('Time', ''),
-                    'link': item.get('Link', ''),
-                    'test_content': item.get('test content', '')
-                }
-                test_results.append(test_result)
-            return test_results if test_results else None
-        
-        return None
-    except Exception as e:
-        # Nếu có lỗi, trả về None (không làm gián đoạn flow chính)
-        return None
-
-def find_candidate_id_in_google_sheet(candidate_name, opening_name, similarity_threshold=0.5):
-    """Tìm candidate_id trong Google Sheet bằng cosine similarity với tên ứng viên và vị trí ứng tuyển"""
-    if not GOOGLE_SHEET_SCRIPT_URL or not candidate_name or not opening_name:
-        return None, 0.0, 0.0
-    
-    # Lấy tất cả dữ liệu từ Google Sheet
-    all_data = get_all_test_results_from_google_sheet()
-    
-    if not all_data or not isinstance(all_data, list):
-        return None, 0.0, 0.0
-    
-    # Tạo map từ candidate_id sang record để lấy thông tin ứng viên và vị trí
-    candidate_map = {}
-    for item in all_data:
-        candidate_id = str(item.get('candidate_id', ''))
-        if candidate_id:
-            if candidate_id not in candidate_map:
-                candidate_map[candidate_id] = {
-                    'candidate_id': candidate_id,
-                    'ten_ung_vien': item.get('Tên ứng viên', ''),
-                    'cong_viec_ung_tuyen': item.get('Công việc ứng tuyển', '')
-                }
-    
-    if not candidate_map:
-        return None, 0.0, 0.0
-    
-    # Kiểm tra exact match trước
-    exact_match = next(
-        (c for c in candidate_map.values() 
-         if c.get('ten_ung_vien') == candidate_name and c.get('cong_viec_ung_tuyen') == opening_name),
-        None
-    )
-    if exact_match:
-        return exact_match.get('candidate_id'), 1.0, 1.0
-    
-    # Dùng cosine similarity để tìm ứng viên phù hợp nhất
-    try:
-        # Tạo danh sách tên ứng viên và vị trí ứng tuyển
-        candidate_names = [c.get('ten_ung_vien', '') for c in candidate_map.values()]
-        opening_names = [c.get('cong_viec_ung_tuyen', '') for c in candidate_map.values()]
-        
-        # Kết hợp tên ứng viên và vị trí để tìm kiếm tốt hơn
-        combined_texts = [
-            f"{name} {opening}" 
-            for name, opening in zip(candidate_names, opening_names)
-        ]
-        query_text = f"{candidate_name} {opening_name}"
-        
-        # Vectorize và tính similarity
-        vectorizer = TfidfVectorizer()
-        text_vectors = vectorizer.fit_transform(combined_texts)
-        query_vector = vectorizer.transform([query_text])
-        
-        similarities = cosine_similarity(query_vector, text_vectors).flatten()
-        best_idx = np.argmax(similarities)
-        best_similarity = similarities[best_idx]
-        
-        # Nếu similarity >= threshold, trả về candidate_id đó
-        if best_similarity >= similarity_threshold:
-            candidate_list = list(candidate_map.values())
-            if best_idx < len(candidate_list):
-                best_candidate = candidate_list[best_idx]
-                return best_candidate.get('candidate_id'), float(best_similarity), 0.0
-        
-        return None, float(best_similarity), 0.0
-    except Exception:
-        return None, 0.0, 0.0
-
-def find_test_by_name(test_results, test_name_query, similarity_threshold=0.5):
-    """Tìm bài test cụ thể trong danh sách test_results bằng cosine similarity với test_name_query"""
-    if not test_results or not isinstance(test_results, list):
-        return None, 0.0
-    
-    if not test_name_query:
-        return None, 0.0
-    
-    # Kiểm tra exact match trước
-    exact_match = next((test for test in test_results if test.get('test_name') == test_name_query), None)
-    if exact_match:
-        return exact_match, 1.0
-    
-    # Lấy danh sách test names
-    test_names = [test.get('test_name', '') for test in test_results if test.get('test_name')]
-    
-    if not test_names:
-        return None, 0.0
-    
-    # Dùng cosine similarity để tìm test name gần nhất
-    try:
-        vectorizer = TfidfVectorizer()
-        name_vectors = vectorizer.fit_transform(test_names)
-        query_vector = vectorizer.transform([test_name_query])
-        
-        similarities = cosine_similarity(query_vector, name_vectors).flatten()
-        best_idx = np.argmax(similarities)
-        best_similarity = similarities[best_idx]
-        
-        # Nếu similarity >= threshold, trả về test đó
-        if best_similarity >= similarity_threshold:
-            tests_with_names = [test for test in test_results if test.get('test_name')]
-            if best_idx < len(tests_with_names):
-                best_test = tests_with_names[best_idx]
-                return best_test, float(best_similarity)
-        
-        return None, float(best_similarity)
-    except Exception:
-        return None, 0.0
-
-def get_candidate_details(candidate_id, api_key):
-    """Lấy và xử lý dữ liệu chi tiết ứng viên từ API Base.vn, trả về JSON phẳng"""
-    url = "https://hiring.base.vn/publicapi/v2/candidate/get"
-    
-    payload = {
-        'access_token': api_key,
-        'id': candidate_id
-    }
-    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-    
-    try:
-        response = requests.post(url, headers=headers, data=payload, timeout=15)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=503, detail=f"Lỗi kết nối đến Base API khi lấy chi tiết ứng viên: {e}")
-    
-    raw_response = response.json()
-    
-    # Kiểm tra API có trả về lỗi logic không (vd: 'code': 1 là thành công)
-    if raw_response.get('code') != 1 or not raw_response.get('candidate'):
-        raise HTTPException(
-            status_code=404, 
-            detail=f"Không tìm thấy ứng viên với ID '{candidate_id}'. {raw_response.get('message', '')}"
-        )
-    
-    # Lấy dữ liệu gốc của ứng viên
-    candidate_data = raw_response.get('candidate', {})
-    
-    # Hàm trợ giúp để "làm phẳng" các danh sách lồng nhau
-    def flatten_fields(field_list):
-        """Chuyển đổi danh sách [{'id': 'key1', 'value': 'val1'}, ...] thành {'key1': 'val1', ...}"""
-        flat_dict = {}
-        if isinstance(field_list, list):
-            for item in field_list:
-                if isinstance(item, dict) and 'id' in item:
-                    flat_dict[item['id']] = item.get('value')
-        return flat_dict
-    
-    # Bắt đầu với các trường dữ liệu chính
-    refined_data = {
-        'id': candidate_data.get('id'),
-        'ten': candidate_data.get('name'),
-        'email': candidate_data.get('email'),
-        'so_dien_thoai': candidate_data.get('phone'),
-        
-        # Lấy tên vị trí tuyển dụng chính xác từ 'evaluations'
-        'vi_tri_ung_tuyen': (candidate_data.get('evaluations') or [{}])[0].get('opening_export', {}).get('name', candidate_data.get('title')),
-        
-        # Lấy opening_id từ evaluations nếu có
-        'opening_id': (candidate_data.get('evaluations') or [{}])[0].get('opening_export', {}).get('id'),
-        
-        # Lấy stage_id và stage_name
-        'stage_id': candidate_data.get('stage_id'),
-        'stage_name': candidate_data.get('stage_name', candidate_data.get('status')),
-        
-        'nguon_ung_vien': candidate_data.get('source'),
-        'ngay_sinh': candidate_data.get('dob'),
-        'gioi_tinh': candidate_data.get('gender_text'),
-        'dia_chi_hien_tai': candidate_data.get('address'),
-        'cccd': candidate_data.get('ssn'),
-        'cv_url': (candidate_data.get('cvs') or [None])[0]
-    }
-    
-    # Xử lý và gộp dữ liệu từ 'fields' và 'form'
-    field_data = flatten_fields(candidate_data.get('fields', []))
-    form_data = flatten_fields(candidate_data.get('form', []))
-    
-    # Cập nhật vào dict chính
-    refined_data.update(field_data)
-    refined_data.update(form_data)
-    
-    # Xử lý evaluations để lấy reviews chi tiết
-    reviews = process_evaluations(candidate_data.get('evaluations', []))
-    refined_data['reviews'] = reviews
-    
-    return refined_data
+    for f in c.get('fields', []) + c.get('form', []):
+        if isinstance(f, dict) and 'id' in f: flat[f['id']] = f.get('value')
+    return flat
 
 # =================================================================
-# Request/Response Models
+# 4. API ENDPOINTS
 # =================================================================
 
-class JobDescriptionResponse(BaseModel):
-    id: str
-    name: str
-    job_description: str
-
-class TestResult(BaseModel):
-    test_name: Optional[str]
-    score: Optional[str]
-    time: Optional[str]
-    link: Optional[str]
-    test_content: Optional[str]
-
-class Review(BaseModel):
-    id: Optional[str]
-    name: str
-    title: str
-    content: str
-
-class OfferLetter(BaseModel):
-    url: Optional[str]
-    name: Optional[str]
-    text: Optional[str]
-
-class CandidateResponse(BaseModel):
-    id: str
-    name: str
-    email: Optional[str]
-    phone: Optional[str]
-    gender: Optional[str]
-    cv_url: Optional[str]
-    cv_text: Optional[str]
-    review: Optional[str]
-    reviews: Optional[list[Review]]
-    form_data: dict
-    opening_id: str
-    stage_id: Optional[str]
-    stage_name: Optional[str]
-    test_results: Optional[list[TestResult]]
-
-# =================================================================
-# API Endpoints
-# =================================================================
-
-@app.get("/", operation_id="healthCheck")
+@app.get("/", include_in_schema=False)
 async def root():
-    """Health check - Kiểm tra trạng thái API"""
+    return {"status": "ok", "message": "Base Hiring API v2.1 (Optimized)"}
+
+@app.get("/api/opening/job-description", 
+         response_model=JDResponse, 
+         response_model_exclude_none=True,
+         operation_id="getJobDescription")
+async def get_job_description(q: Optional[str] = Query(None, alias="opening_name_or_id")):
+    """Lấy Job Description. Tìm theo tên hoặc ID."""
+    openings = get_base_openings(BASE_API_KEY)
+    if not q:
+        return {"found": False, "suggestions": openings}
+    
+    oid, name, sim = find_opening_id_by_name(q, BASE_API_KEY)
+    if not oid:
+        return {"found": False, "query": q, "sim": sim, "suggestions": openings}
+    
+    jds = get_job_descriptions(BASE_API_KEY)
+    jd_obj = next((j for j in jds if j['id'] == oid), None)
+    
+    if not jd_obj:
+         return {"found": False, "query": q, "sim": sim, "oid": oid, "oname": name, "suggestions": openings}
+         
     return {
-        "status": "ok",
-        "message": "Base Hiring API - Trích xuất JD và CV",
-        "endpoints": {
-            "get_candidates": "/api/opening/{opening_name_or_id}/candidates",
-            "get_job_description": "/api/opening/job-description?opening_name_or_id={opening_name_or_id}",
-            "get_interviews": "/api/interviews",
-            "get_candidate_details": "/api/candidate",
-            "get_offer_letter": "/api/offer-letter",
-            "get_test_result": "/api/test-result"
-        },
-        "note": "Có thể sử dụng opening_name hoặc opening_id. Hệ thống sẽ tự động tìm opening gần nhất bằng cosine similarity nếu dùng name."
+        "found": True,
+        "query": q,
+        "sim": sim,
+        "oid": oid,
+        "oname": name,
+        "jd": jd_obj['job_description']
     }
 
-@app.get("/api/opening/job-description", operation_id="layJobDescriptionTheoOpening")
-async def get_job_description_by_opening(
-    opening_name_or_id: Optional[str] = Query(None, description="Tên hoặc ID của vị trí tuyển dụng. Bỏ trống để lấy tất cả các opening có status 10.")
+@app.get("/api/opening/{opening_name_or_id}/candidates", 
+         response_model=ListCandidateResponse, 
+         response_model_exclude_none=True,
+         operation_id="getCandidates")
+async def get_candidates(
+    q: str = Path(..., alias="opening_name_or_id"),
+    start: Optional[str] = Query(None, alias="start_date"),
+    end: Optional[str] = Query(None, alias="end_date"),
+    stage: Optional[str] = Query(None, alias="stage_name")
 ):
-    """Lấy JD (Job Description) theo opening_name hoặc opening_id. Nếu không có tham số hoặc không tìm thấy, trả về tất cả các opening có status 10 (chỉ id và name)."""
-    try:
-        # Lấy danh sách openings có status 10 (chỉ id và name)
-        openings = get_base_openings(BASE_API_KEY, use_cache=True)
-        
-        # Nếu không có opening_name_or_id, trả về tất cả các opening có status 10 (chỉ id và name)
-        if not opening_name_or_id:
-            return {
-                "success": True,
-                "query": None,
-                "message": "Trả về tất cả các opening có status 10.",
-                "total_openings": len(openings),
-                "openings": openings
-            }
-        
-        # Tìm opening_id từ name hoặc id bằng cosine similarity
-        opening_id, matched_name, similarity_score = find_opening_id_by_name(
-            opening_name_or_id, 
-            BASE_API_KEY
-        )
-        
-        # Nếu không tìm thấy opening cụ thể, trả về tất cả các opening có status 10 (chỉ id và name)
-        if not opening_id:
-            return {
-                "success": True,
-                "query": opening_name_or_id,
-                "message": f"Không tìm thấy vị trí phù hợp với '{opening_name_or_id}'. Trả về tất cả các opening có status 10.",
-                "similarity_score": similarity_score,
-                "total_openings": len(openings),
-                "openings": openings
-            }
-        
-        # Lấy JD (Job Description) để tìm JD cụ thể
-        jds = get_job_descriptions(BASE_API_KEY, use_cache=True)
-        jd = next((jd for jd in jds if jd['id'] == opening_id), None)
-        
-        if not jd:
-            # Thử làm mới cache nếu không tìm thấy
-            jds = get_job_descriptions(BASE_API_KEY, use_cache=False)
-            jd = next((jd for jd in jds if jd['id'] == opening_id), None)
-        
-        # Nếu vẫn không tìm thấy JD cụ thể, trả về tất cả các opening có status 10 (chỉ id và name)
-        if not jd:
-            return {
-                "success": True,
-                "query": opening_name_or_id,
-                "opening_id": opening_id,
-                "opening_name": matched_name,
-                "similarity_score": similarity_score,
-                "message": f"Không tìm thấy JD cho vị trí '{opening_name_or_id}'. Trả về tất cả các opening có status 10.",
-                "total_openings": len(openings),
-                "openings": openings
-            }
-        
-        return {
-            "success": True,
-            "query": opening_name_or_id,
-            "opening_id": opening_id,
-            "opening_name": matched_name,
-            "similarity_score": similarity_score,
-            "job_description": jd['job_description']
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy JD: {str(e)}")
+    """Lấy danh sách ứng viên theo vị trí tuyển dụng."""
+    oid, name, sim = find_opening_id_by_name(q, BASE_API_KEY)
+    if not oid: raise HTTPException(404, f"Không tìm thấy opening '{q}'")
+    
+    s_date = datetime.strptime(start, "%Y-%m-%d").date() if start else None
+    e_date = datetime.strptime(end, "%Y-%m-%d").date() if end else None
 
-@app.get("/api/opening/{opening_name_or_id}/candidates", operation_id="layUngVienTheoOpening")
-async def get_candidates_by_opening(
-    opening_name_or_id: str = Path(..., description="Tên hoặc ID của vị trí tuyển dụng"),
-    start_date: Optional[str] = Query(None, description="Ngày bắt đầu lọc ứng viên (YYYY-MM-DD). Bỏ trống để lấy tất cả."),
-    end_date: Optional[str] = Query(None, description="Ngày kết thúc lọc ứng viên (YYYY-MM-DD). Bỏ trống để lấy tất cả."),
-    stage_name: Optional[str] = Query(None, description="Lọc ứng viên theo stage name. Bỏ trống để lấy tất cả.")
-):
-    """Lấy tất cả ứng viên theo opening_name hoặc opening_id (bao gồm cv_text)"""
+    # Lấy list candidates
     try:
-        start_date_obj, end_date_obj = None, None
-        if start_date:
-            start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").date()
-        if end_date:
-            end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").date()
-        
-        if start_date_obj and end_date_obj and start_date_obj > end_date_obj:
-            raise HTTPException(status_code=400, detail="Ngày kết thúc phải sau ngày bắt đầu")
-        
-        # Tìm opening_id từ name hoặc id bằng cosine similarity
-        opening_id, matched_name, similarity_score = find_opening_id_by_name(
-            opening_name_or_id, 
-            BASE_API_KEY
-        )
-        
-        if not opening_id:
-            raise HTTPException(
-                status_code=404, 
-                detail=f"Không tìm thấy vị trí phù hợp với '{opening_name_or_id}'. Similarity score cao nhất: {similarity_score:.2f}"
-            )
-        
-        candidates = get_candidates_for_opening(opening_id, BASE_API_KEY, start_date_obj, end_date_obj, stage_name)
-        
-        # Lấy JD (Job Description)
-        jds = get_job_descriptions(BASE_API_KEY, use_cache=True)
-        jd = next((jd for jd in jds if jd['id'] == opening_id), None)
-        
-        if not jd:
-            # Thử làm mới cache nếu không tìm thấy
-            jds = get_job_descriptions(BASE_API_KEY, use_cache=False)
-            jd = next((jd for jd in jds if jd['id'] == opening_id), None)
-        
-        job_description = jd['job_description'] if jd else None
-        
-        return {
-            "success": True,
-            "query": opening_name_or_id,
-            "opening_id": opening_id,
-            "opening_name": matched_name,
-            "similarity_score": similarity_score,
-            "job_description": job_description,
-            "total_candidates": len(candidates),
-            "candidates": candidates
-        }
-    except HTTPException:
-        raise
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Định dạng ngày không hợp lệ: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy ứng viên: {str(e)}")
+        payload = {'access_token': BASE_API_KEY, 'opening_id': oid}
+        if s_date: payload['start_date'] = start
+        if e_date: payload['end_date'] = end
+        resp = requests.post("https://hiring.base.vn/publicapi/v2/candidate/list", data=payload, timeout=15)
+        all_cands = resp.json().get('candidates', [])
+    except: all_cands = []
 
-@app.get("/api/interviews", operation_id="layLichPhongVan")
-async def get_interviews_by_opening(
-    opening_name_or_id: Optional[str] = Query(None, description="Tên hoặc ID của vị trí tuyển dụng để lọc. Bỏ trống để lấy tất cả."),
-    date: Optional[str] = Query(None, description="Lấy lịch phỏng vấn cho 1 ngày cụ thể (YYYY-MM-DD). Nếu có tham số này, sẽ bỏ qua start_date và end_date."),
-    start_date: Optional[str] = Query(None, description="Ngày bắt đầu lọc lịch phỏng vấn (YYYY-MM-DD). Bỏ trống để lấy tất cả."),
-    end_date: Optional[str] = Query(None, description="Ngày kết thúc lọc lịch phỏng vấn (YYYY-MM-DD). Bỏ trống để lấy tất cả.")
-):
-    """Lấy lịch phỏng vấn, có thể lọc theo opening_name hoặc opening_id (tự động tìm bằng cosine similarity). Có thể lấy cho 1 ngày cụ thể bằng tham số date. Lọc dựa trên date của time_dt."""
-    try:
-        filter_date_obj = None
-        
-        # Nếu có tham số date, dùng nó để lọc dựa trên time_dt
-        if date:
-            filter_date_obj = datetime.strptime(date, "%Y-%m-%d").date()
-        
-        opening_id = None
-        matched_name = None
-        similarity_score = None
-        
-        # Nếu có opening_name_or_id, tìm opening_id bằng cosine similarity
-        if opening_name_or_id:
-            opening_id, matched_name, similarity_score = find_opening_id_by_name(
-                opening_name_or_id,
-                BASE_API_KEY
-            )
-            
-            if not opening_id:
-                # Nếu không tìm thấy, vẫn trả về tất cả interviews nhưng có thông báo
-                opening_id = None
-        
-        # Lấy tất cả interviews và lọc dựa trên date của time_dt
-        interviews = get_interviews(BASE_API_KEY, opening_id=opening_id, filter_date=filter_date_obj)
-        
-        return {
-            "success": True,
-            "query": opening_name_or_id,
-            "date": date,
-            "opening_id": opening_id,
-            "opening_name": matched_name,
-            "similarity_score": similarity_score,
-            "total_interviews": len(interviews),
-            "interviews": interviews
-        }
-    except HTTPException:
-        raise
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=f"Định dạng ngày không hợp lệ: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy lịch phỏng vấn: {str(e)}")
+    # Lọc stage
+    target_cands = all_cands
+    if stage:
+        unique_stages = list(set([c.get('stage_name') for c in all_cands if c.get('stage_name')]))
+        matched_stages = None
+        if stage in unique_stages: matched_stages = [stage]
+        else:
+            # Cosine sim cho stage name
+            try:
+                vec = TfidfVectorizer()
+                tfidf = vec.fit_transform(unique_stages + [stage])
+                sims = cosine_similarity(tfidf[-1], tfidf[:-1]).flatten()
+                if len(sims) > 0 and np.max(sims) >= 0.3:
+                    matched_stages = [unique_stages[np.argmax(sims)]]
+            except: pass
+        if matched_stages:
+            target_cands = [c for c in all_cands if c.get('stage_name') in matched_stages]
 
-@app.get("/api/candidate", operation_id="layChiTietUngVien")
-async def get_candidate_details_endpoint(
-    candidate_id: Optional[str] = Query(None, description="ID của ứng viên. Bắt buộc nếu không có opening_name_or_id và candidate_name."),
-    opening_name_or_id: Optional[str] = Query(None, description="Tên hoặc ID của vị trí tuyển dụng để tìm kiếm bằng cosine similarity. Bắt buộc nếu không có candidate_id."),
-    candidate_name: Optional[str] = Query(None, description="Tên ứng viên để tìm kiếm bằng cosine similarity trong opening. Bắt buộc nếu không có candidate_id.")
-):
-    """Lấy chi tiết ứng viên. Có thể tìm bằng candidate_id, hoặc bằng opening_name_or_id + candidate_name (dùng cosine similarity). Tự động trích xuất cv_text từ cv_url bằng Gemini AI và thêm JD dựa trên opening name."""
-    try:
-        found_candidate_id = candidate_id
-        opening_id = None
-        opening_name_matched = None
-        opening_similarity = None
-        candidate_similarity = None
-        
-        # Nếu không có candidate_id, phải có cả opening_name_or_id và candidate_name
-        if not found_candidate_id:
-            if not opening_name_or_id or not candidate_name:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Phải cung cấp candidate_id, hoặc cả opening_name_or_id và candidate_name"
-                )
-            
-            # Tìm opening_id từ opening_name_or_id bằng cosine similarity
-            opening_id, opening_name_matched, opening_similarity = find_opening_id_by_name(
-                opening_name_or_id,
-                BASE_API_KEY
-            )
-            
-            if not opening_id:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Không tìm thấy vị trí phù hợp với '{opening_name_or_id}'. Similarity score cao nhất: {opening_similarity:.2f}"
-                )
-            
-            # Tìm candidate trong opening đó bằng tên với cosine similarity (không filter stage)
-            found_candidate_id, candidate_similarity = find_candidate_by_name_in_opening(
-                candidate_name,
-                opening_id,
-                BASE_API_KEY,
-                similarity_threshold=0.5,
-                filter_stages=None  # Không lọc stage cho endpoint candidate
-            )
-            
-            if not found_candidate_id:
-                error_msg = f"Không tìm thấy ứng viên phù hợp với tên '{candidate_name}' trong vị trí '{opening_name_matched}'. "
-                if candidate_similarity is not None:
-                    error_msg += f"Candidate similarity score cao nhất: {candidate_similarity:.2f}"
-                raise HTTPException(status_code=404, detail=error_msg)
-        
-        # Lấy dữ liệu chi tiết ứng viên
-        candidate_data = get_candidate_details(found_candidate_id, BASE_API_KEY)
-        
-        # Trích xuất cv_text từ cv_url nếu có
-        cv_url = candidate_data.get('cv_url')
-        cv_text = None
-        if cv_url:
-            cv_text = extract_text_from_cv_url_with_genai(cv_url)
-            candidate_data['cv_text'] = cv_text
-        
-        # Lấy dữ liệu bài test từ Google Sheet
-        test_results = get_test_results_from_google_sheet(found_candidate_id)
-        candidate_data['test_results'] = test_results
-        
-        # Lấy JD dựa trên opening name
-        opening_name = candidate_data.get('vi_tri_ung_tuyen')
-        opening_id = candidate_data.get('opening_id')
-        job_description = None
-        
-        if opening_name or opening_id:
-            # Tìm opening_id nếu chỉ có opening_name
-            if not opening_id and opening_name:
-                opening_id, matched_name, similarity_score = find_opening_id_by_name(
-                    opening_name,
-                    BASE_API_KEY
-                )
-            
-            # Lấy JD nếu có opening_id
-            if opening_id:
-                jds = get_job_descriptions(BASE_API_KEY, use_cache=True)
-                jd = next((jd for jd in jds if jd['id'] == opening_id), None)
-                
-                if not jd:
-                    # Thử làm mới cache nếu không tìm thấy
-                    jds = get_job_descriptions(BASE_API_KEY, use_cache=False)
-                    jd = next((jd for jd in jds if jd['id'] == opening_id), None)
-                
-                if jd:
-                    job_description = jd['job_description']
-                    candidate_data['job_description'] = job_description
-        
-        result = {
-            "success": True,
-            "candidate_id": found_candidate_id,
-            "candidate_details": candidate_data
-        }
-        
-        # Thêm thông tin similarity nếu tìm bằng tên
-        if opening_similarity is not None:
-            result["opening_similarity_score"] = opening_similarity
-            result["opening_id"] = opening_id
-            result["opening_name"] = opening_name_matched
-        if candidate_similarity is not None:
-            result["candidate_similarity_score"] = candidate_similarity
-        
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy chi tiết ứng viên: {str(e)}")
+    # Map to SlimCandidate format
+    output_cands = []
+    for c in target_cands:
+        cv_url = (c.get('cvs') or [None])[0]
+        form_d = {f['id']: f['value'] for f in c.get('form', []) if 'id' in f}
+        output_cands.append({
+            "id": c.get('id'),
+            "name": c.get('name'),
+            "email": c.get('email'),
+            "phone": c.get('phone'),
+            "cv_url": cv_url,
+            "cv_text": extract_text_from_cv_url_with_genai(cv_url) if cv_url else None, # Lazy extraction
+            "reviews": process_evaluations(c.get('evaluations', [])),
+            "stage_name": c.get('stage_name'),
+            "form_data": form_d
+        })
+    
+    # Get JD for context
+    jds = get_job_descriptions(BASE_API_KEY)
+    jd_text = next((j['job_description'] for j in jds if j['id'] == oid), None)
 
-@app.get("/api/offer-letter", operation_id="layOfferLetterTheoUngVien")
-async def get_offer_letter_by_candidate(
-    candidate_id: Optional[str] = Query(None, description="ID của ứng viên. Bắt buộc nếu không có opening_name_or_id và candidate_name."),
-    opening_name_or_id: Optional[str] = Query(None, description="Tên hoặc ID của vị trí tuyển dụng để tìm kiếm bằng cosine similarity. Bắt buộc nếu không có candidate_id."),
-    candidate_name: Optional[str] = Query(None, description="Tên ứng viên để tìm kiếm bằng cosine similarity trong opening. Bắt buộc nếu không có candidate_id.")
-):
-    """Lấy offer letter của ứng viên. Có thể tìm bằng candidate_id, hoặc bằng opening_name_or_id + candidate_name (dùng cosine similarity). Trả về tên ứng viên, vị trí ứng tuyển và nội dung offer letter."""
-    try:
-        found_candidate_id = candidate_id
-        opening_id = None
-        opening_name_matched = None
-        opening_similarity = None
-        candidate_similarity = None
-        
-        # Nếu không có candidate_id, phải có cả opening_name_or_id và candidate_name
-        if not found_candidate_id:
-            if not opening_name_or_id or not candidate_name:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Phải cung cấp candidate_id, hoặc cả opening_name_or_id và candidate_name"
-                )
-            
-            # Tìm opening_id từ opening_name_or_id bằng cosine similarity
-            opening_id, opening_name_matched, opening_similarity = find_opening_id_by_name(
-                opening_name_or_id,
-                BASE_API_KEY
-            )
-            
-            if not opening_id:
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Không tìm thấy vị trí phù hợp với '{opening_name_or_id}'. Similarity score cao nhất: {opening_similarity:.2f}"
-                )
-            
-            # Tìm candidate trong opening đó bằng tên với cosine similarity (chỉ tìm trong stage "Offered" và "Hired")
-            found_candidate_id, candidate_similarity = find_candidate_by_name_in_opening(
-                candidate_name,
-                opening_id,
-                BASE_API_KEY,
-                similarity_threshold=0.5,
-                filter_stages=['Offered', 'Hired']  # Chỉ lọc stage cho offer letter
-            )
-            
-            if not found_candidate_id:
-                error_msg = f"Không tìm thấy ứng viên phù hợp với tên '{candidate_name}' trong vị trí '{opening_name_matched}'. "
-                if candidate_similarity is not None:
-                    error_msg += f"Candidate similarity score cao nhất: {candidate_similarity:.2f}"
-                raise HTTPException(status_code=404, detail=error_msg)
-        
-        # Lấy thông tin cơ bản của ứng viên để lấy tên và vị trí ứng tuyển
-        candidate_data = get_candidate_details(found_candidate_id, BASE_API_KEY)
-        
-        candidate_name_result = candidate_data.get('ten')
-        vi_tri_ung_tuyen = candidate_data.get('vi_tri_ung_tuyen')
-        
-        # Lấy offer letter
-        offer_letter = get_offer_letter(found_candidate_id, BASE_API_KEY)
-        
-        if not offer_letter:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Không tìm thấy offer letter cho ứng viên với ID '{found_candidate_id}'"
-            )
-        
-        result = {
-            "success": True,
-            "candidate_id": found_candidate_id,
-            "candidate_name": candidate_name_result,
-            "vi_tri_ung_tuyen": vi_tri_ung_tuyen,
-            "offer_letter": offer_letter
-        }
-        
-        # Thêm thông tin similarity nếu tìm bằng tên
-        if opening_similarity is not None:
-            result["opening_similarity_score"] = opening_similarity
-            result["opening_id"] = opening_id
-            result["opening_name"] = opening_name_matched
-        if candidate_similarity is not None:
-            result["candidate_similarity_score"] = candidate_similarity
-        
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy offer letter: {str(e)}")
+    return {
+        "oid": oid,
+        "oname": name,
+        "sim": sim,
+        "total": len(output_cands),
+        "jd": jd_text,
+        "candidates": output_cands
+    }
 
-@app.get("/api/test-result", operation_id="layBaiTestCuTheCuaUngVien")
-async def get_specific_test_result(
-    test_name: str = Query(..., description="Tên bài test cần lấy (dùng similarity để tìm)"),
-    candidate_id: Optional[str] = Query(None, description="ID của ứng viên. Bắt buộc nếu không có opening_name và candidate_name."),
-    opening_name: Optional[str] = Query(None, description="Tên vị trí ứng tuyển để tìm kiếm bằng cosine similarity trong Google Sheet. Bắt buộc nếu không có candidate_id."),
-    candidate_name: Optional[str] = Query(None, description="Tên ứng viên để tìm kiếm bằng cosine similarity trong Google Sheet. Bắt buộc nếu không có candidate_id.")
+@app.get("/api/interviews", 
+         response_model=InterviewResponse, 
+         response_model_exclude_none=True,
+         operation_id="getInterviews")
+async def get_interviews(
+    q: Optional[str] = Query(None, alias="opening_name_or_id"),
+    date_str: Optional[str] = Query(None, alias="date")
 ):
-    """Lấy bài test cụ thể của ứng viên từ Google Sheet. Có thể tìm bằng candidate_id trực tiếp, hoặc bằng opening_name + candidate_name (dùng cosine similarity trong Google Sheet). Sau đó tìm bài test theo test_name bằng cosine similarity."""
+    """Lấy lịch phỏng vấn, lọc theo ngày hoặc vị trí."""
+    oid = None
+    if q: oid, _, _ = find_opening_id_by_name(q, BASE_API_KEY)
+    filter_date = datetime.strptime(date_str, "%Y-%m-%d").date() if date_str else None
+    
     try:
-        # Kiểm tra Google Sheet Script URL có được cấu hình không
-        if not GOOGLE_SHEET_SCRIPT_URL:
-            raise HTTPException(
-                status_code=503,
-                detail="Google Sheet Script URL chưa được cấu hình"
-            )
+        resp = requests.post("https://hiring.base.vn/publicapi/v2/interview/list", data={'access_token': BASE_API_KEY}, timeout=10)
+        raw = resp.json().get('interviews', [])
+    except: raw = []
+
+    filtered = []
+    hcm = timezone('Asia/Ho_Chi_Minh')
+    
+    for i in raw:
+        if oid and i.get('opening_id') != oid: continue
         
-        found_candidate_id = candidate_id
-        candidate_similarity_score = None
-        opening_name_matched = None
+        t_iso = None
+        if i.get('time'):
+            dt = datetime.fromtimestamp(int(i['time']), tz=timezone('UTC')).astimezone(hcm)
+            t_iso = dt.isoformat()
+            if filter_date and dt.date() != filter_date: continue
         
-        # Nếu không có candidate_id, phải có cả opening_name và candidate_name để tìm trong Google Sheet
-        if not found_candidate_id:
-            if not opening_name or not candidate_name:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Phải cung cấp candidate_id, hoặc cả opening_name và candidate_name để tìm trong Google Sheet"
-                )
-            
-            # Tìm candidate_id trong Google Sheet bằng cosine similarity với tên ứng viên và vị trí ứng tuyển
-            found_candidate_id, candidate_similarity_score, _ = find_candidate_id_in_google_sheet(
-                candidate_name,
-                opening_name,
-                similarity_threshold=0.5
-            )
-            
-            if not found_candidate_id:
-                error_msg = f"Không tìm thấy ứng viên phù hợp với tên '{candidate_name}' và vị trí '{opening_name}' trong Google Sheet. "
-                if candidate_similarity_score is not None:
-                    error_msg += f"Similarity score cao nhất: {candidate_similarity_score:.2f}"
-                raise HTTPException(status_code=404, detail=error_msg)
-            
-            opening_name_matched = opening_name
+        filtered.append({
+            "id": i.get('id'),
+            "candidate_name": i.get('candidate_name'),
+            "opening_name": i.get('opening_name'),
+            "time_dt": t_iso
+        })
+
+    return {"total": len(filtered), "interviews": filtered}
+
+@app.get("/api/candidate", 
+         response_model=CandidateDetailResponse, 
+         response_model_exclude_none=True,
+         operation_id="getCandidateDetail")
+async def get_candidate_detail(
+    cid: Optional[str] = Query(None, alias="candidate_id"),
+    op_q: Optional[str] = Query(None, alias="opening_name_or_id"),
+    c_name: Optional[str] = Query(None, alias="candidate_name")
+):
+    """Lấy chi tiết ứng viên (CV full, Test results)."""
+    final_cid = cid
+    sim_op = None
+    sim_cand = None
+    
+    if not final_cid:
+        if not op_q or not c_name: raise HTTPException(400, "Thiếu thông tin định danh ứng viên")
+        oid, _, sim_op = find_opening_id_by_name(op_q, BASE_API_KEY)
+        if not oid: raise HTTPException(404, "Opening not found")
+        final_cid, sim_cand = find_candidate_by_name_in_opening(c_name, oid, BASE_API_KEY)
+        if not final_cid: raise HTTPException(404, "Candidate not found")
+
+    details = get_candidate_details_full(final_cid, BASE_API_KEY)
+    
+    # Full Extract CV
+    cv_txt = None
+    if details.get('cv_url'):
+        cv_txt = extract_text_from_cv_url_with_genai(details['cv_url'])
+    
+    # Get Tests
+    tests = get_test_results_from_google_sheet(final_cid)
+    
+    # Get JD
+    jd = None
+    if details.get('opening_id'):
+        jds = get_job_descriptions(BASE_API_KEY)
+        jd = next((j['job_description'] for j in jds if j['id'] == details['opening_id']), None)
+
+    return {
+        "cid": final_cid,
+        "details": details,
+        "cv_txt": cv_txt,
+        "tests": tests,
+        "jd": jd,
+        "sim_op": sim_op,
+        "sim_cand": sim_cand
+    }
+
+@app.get("/api/offer-letter",
+         response_model=OfferLetterResponse,
+         response_model_exclude_none=True,
+         operation_id="getOfferLetter")
+async def get_offer_letter_endpoint(
+    cid: Optional[str] = Query(None, alias="candidate_id"),
+    op_q: Optional[str] = Query(None, alias="opening_name_or_id"),
+    c_name: Optional[str] = Query(None, alias="candidate_name")
+):
+    """Tìm và trích xuất nội dung Offer Letter."""
+    final_cid = cid
+    sim_op = None
+    sim_cand = None
+
+    if not final_cid:
+        if not op_q or not c_name: raise HTTPException(400, "Thiếu thông tin")
+        oid, _, sim_op = find_opening_id_by_name(op_q, BASE_API_KEY)
+        if not oid: raise HTTPException(404, "Opening not found")
+        final_cid, sim_cand = find_candidate_by_name_in_opening(c_name, oid, BASE_API_KEY, filter_stages=['Offered', 'Hired'])
+        if not final_cid: raise HTTPException(404, "Candidate not found in Offered/Hired stage")
+
+    details = get_candidate_details_full(final_cid, BASE_API_KEY)
+    offer = get_offer_letter(final_cid, BASE_API_KEY)
+    
+    if not offer: raise HTTPException(404, "No offer letter found")
+
+    return {
+        "cid": final_cid,
+        "cname": details.get('ten', ''),
+        "position": details.get('opening_name', ''),
+        "letter_text": offer.get('text'),
+        "letter_url": offer.get('url'),
+        "sim_op": sim_op,
+        "sim_cand": sim_cand
+    }
+
+@app.get("/api/test-result",
+         response_model=TestResultResponse,
+         response_model_exclude_none=True,
+         operation_id="getTestResult")
+async def get_test_result_endpoint(
+    t_name: str = Query(..., alias="test_name"),
+    cid: Optional[str] = Query(None, alias="candidate_id"),
+    op_q: Optional[str] = Query(None, alias="opening_name_or_id"),
+    c_name: Optional[str] = Query(None, alias="candidate_name")
+):
+    """Tìm kết quả bài test cụ thể."""
+    final_cid = cid
+    
+    # Logic tìm Candidate ID nếu thiếu (tương tự trên nhưng thêm logic tìm trong Sheet)
+    # Để đơn giản hóa cho bản optimized, ta reuse logic tìm trong Base trước
+    if not final_cid:
+        if not op_q or not c_name: raise HTTPException(400, "Thiếu thông tin")
+        oid, _, _ = find_opening_id_by_name(op_q, BASE_API_KEY)
+        if oid:
+             final_cid, _ = find_candidate_by_name_in_opening(c_name, oid, BASE_API_KEY)
         
-        # Đảm bảo found_candidate_id là string
-        found_candidate_id = str(found_candidate_id) if found_candidate_id else None
-        if not found_candidate_id:
-            raise HTTPException(
-                status_code=400,
-                detail="Không thể xác định candidate_id"
-            )
-        
-        # Lấy tất cả bài test của ứng viên từ Google Sheet
-        all_test_results = get_test_results_from_google_sheet(found_candidate_id)
-        
-        if all_test_results is None:
-            raise HTTPException(
-                status_code=503,
-                detail=f"Lỗi khi kết nối đến Google Sheet hoặc không tìm thấy bài test nào cho ứng viên với ID '{found_candidate_id}'"
-            )
-        
-        if not isinstance(all_test_results, list) or len(all_test_results) == 0:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Không tìm thấy bài test nào cho ứng viên với ID '{found_candidate_id}' trong Google Sheet"
-            )
-        
-        # Tìm bài test cụ thể theo test_name bằng cosine similarity
-        specific_test, test_similarity = find_test_by_name(all_test_results, test_name, similarity_threshold=0.5)
-        
-        if not specific_test:
-            error_msg = f"Không tìm thấy bài test phù hợp với tên '{test_name}' cho ứng viên với ID '{found_candidate_id}'. "
-            if test_similarity is not None:
-                error_msg += f"Test similarity score cao nhất: {test_similarity:.2f}"
-            raise HTTPException(status_code=404, detail=error_msg)
-        
-        # Lấy thông tin ứng viên từ Google Sheet để trả về (từ bài test đã tìm thấy hoặc từ all_data)
-        candidate_name_result = None
-        opening_name_result = opening_name_matched
-        
-        # Thử lấy từ bài test đã tìm thấy trước (nếu có trong data)
-        # Nếu không có, thử lấy từ all_data
-        all_data = get_all_test_results_from_google_sheet()
-        if all_data and isinstance(all_data, list):
-            for item in all_data:
-                if str(item.get('candidate_id', '')) == str(found_candidate_id):
-                    candidate_name_result = item.get('Tên ứng viên', '') or candidate_name_result
-                    opening_name_result = item.get('Công việc ứng tuyển', '') or opening_name_result or opening_name_matched
-                    break
-        
-        result = {
-            "success": True,
-            "candidate_id": found_candidate_id,
-            "candidate_name": candidate_name_result,
-            "opening_name": opening_name_result,
-            "test_name": specific_test.get('test_name'),
-            "test_result": specific_test,
-            "test_similarity_score": test_similarity
-        }
-        
-        # Thêm thông tin similarity nếu tìm bằng tên
-        if candidate_similarity_score is not None:
-            result["candidate_similarity_score"] = candidate_similarity_score
-        
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi khi lấy bài test: {str(e)}")
+        # Fallback: Nếu không thấy trong Base, user có thể implement tìm fuzzy trong Sheet
+        if not final_cid: raise HTTPException(404, "Candidate not found")
+
+    tests = get_test_results_from_google_sheet(final_cid)
+    if not tests: raise HTTPException(404, "No tests found")
+
+    found_test, sim = find_test_by_name(tests, t_name)
+    if not found_test: raise HTTPException(404, "Test not found")
+
+    # Lấy tên candidate từ list test (nếu có) hoặc fallback
+    return {
+        "cid": final_cid,
+        "test_name": t_name,
+        "result": found_test,
+        "sim_test": sim
+    }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
