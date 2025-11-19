@@ -13,3 +13,4 @@ scikit-learn
 python-dotenv
 python-docx
 gunicorn
+orjson
